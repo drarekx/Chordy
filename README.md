@@ -49,15 +49,29 @@ Basado en [ChordBoy](https://www.jameshsi.com/?ref=chordboy) de james.
 - **MIDI**: cualquier controlador, conexión automática, monitor, «learn» de cualquier pad/tecla/botón/knob/rueda, automapeo y modo guiado. Funciona aunque Chordy esté en segundo plano.
 - **Launchkey 25 MK2**: pads, 8 knobs al sonido, ruedas (pitch bend y vibrato), transporte y **luces de los pads** que muestran el acorde que suena, los colores, la octava y el estado de grabar/reproducir.
 - **Salida MIDI «Chordy»**: un dispositivo virtual para grabar lo que tocas en Logic, GarageBand o Ableton.
+- **Estudio a pantalla completa**: cada teclado MIDI conectado tiene su tarjeta, su color y **su propio sonido**, modo (notas, acordes cromáticos o grados), zona, octava, curva de fuerza, volumen y efectos. Los teclados nuevos se añaden solos. Un rollo «Lo que suena» muestra lo que toca cada uno, y una mezcla con un fader por teclado, batería y loops.
+- **Instrumentos reales**: piano de cola Salamander (Yamaha C5), piano vertical, pianos eléctricos, órganos, cuerdas, coro, guitarras, bajos, vientos, pads y ocho baterías. Se descargan desde la app y suenan con la fuerza con que tocas y con pedal de sustain.
+- **Cambiar de sonido al momento**: 8 favoritos por teclado (clic), ◀ ▶ del Launchkey, teclas 1–8 del Mac o los botones de voz del teclado (cambio de programa).
+- **Dibujo de los aparatos**: el Launchkey 25 MK2 y el Yamaha PSR-E453 dibujados en vivo; las teclas, pads, knobs y ruedas se mueven al tocarlos y muestran a qué están asignados.
+- **Caja de ritmos**: patrones A–H de 16 pasos con kit propio, fuerza por paso, volumen, silencio y solo por pista, sonidos alternativos del kit, cadena de patrones para una canción, herramientas (rellenar, desplazar, aleatorio) y grabación tocando los pads. Vista propia a pantalla completa (⌘B). Los pads del Launchkey programan los pasos o tocan la batería.
+- **Editor de loops**: mover, alargar, añadir y borrar notas y acordes; cambiar tono, tempo y largo; transponer, cuantizar y suavizar; duplicar; reverb, eco y filtro por loop. Los loops graban también las notas sueltas del piano y el instrumento de cada parte.
 - **Colores**: temas clásicos con sus colores oficiales (Solarized, Dracula, Nord, Gruvbox, Monokai, One Dark, Tokyo Night, Catppuccin, Rosé Pine, Everforest, Kanagawa, GitHub Dark) además del original.
 - **Idiomas**: castellano, inglés y catalán.
 - **Abrir al iniciar sesión**: se activa la primera vez que se abre desde Aplicaciones; se puede quitar en Ajustes.
 
 ¿Te es útil? [Invítame a un café](https://buymeacoffee.com/drarek) ☕
 
+## Créditos de los instrumentos
+
+- Salamander Grand Piano V3, de Alexander Holm (CC BY 3.0), SF2 de FreePats.
+- Upright Piano KW, de FreePats (CC0).
+- GeneralUser GS, de S. Christian Collins (GeneralUser GS License v2.0).
+- Banco General MIDI incluido en macOS.
+
 ## Dónde guarda las cosas
 
-- Loops, sonidos propios y mapeo MIDI: `~/Library/Application Support/Chordy/` (`loops.json`, `sounds.json`, `midi-map.json`).
+- Loops, sonidos propios, teclados, batería y mapeo MIDI: `~/Library/Application Support/Chordy/` (`loops.json`, `sounds.json`, `keyboards.json`, `drums.json`, `midi-map.json`).
+- Instrumentos descargados: `~/Library/Application Support/Chordy/Instruments/` (el piano de cola ocupa 1,3 GB; se quitan desde Sonido → Bancos).
 - Ajustes (tono, modo, tempo, tema, idioma…): `defaults read com.egluu.chordy`
 
 ## Desinstalar
