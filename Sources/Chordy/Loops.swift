@@ -66,22 +66,33 @@ enum LoopMath {
     private static let epsilon = 1e-6
 
     private static func snap(_ beats: Double) -> Double { (beats / quantum).rounded() * quantum }
+    /// Finest step kept when recording without quantize (1/96 of a beat ≈ 6 ms at 110 bpm).
+    static let fine = 1.0 / 96
 
     /// Wall-clock chords → loop events. The length rounds to whole bars (at least one).
+    /// `grid`: snap starts and ends to it (0.25 = sixteenths); 0 keeps the timing as played.
+    /// The length is whole bars from where Stop was pressed, but never shorter than the last
+    /// note: a take started mid-bar used to lose its last notes.
     static func build(_ chords: [PlayedChord], notes: [PlayedNote] = [], start: Double, end: Double,
-                      bpm: Int) -> (Double, [LoopEvent]) {
+                      bpm: Int, grid: Double = 0) -> (Double, [LoopEvent]) {
         let toBeats = { (t: Double) in (t - start) * Double(bpm) / 60 }
-        let bars = max(1, (toBeats(end) / beatsPerBar).rounded())
-        let length = bars * beatsPerBar
+        let step = grid > 0 ? grid : fine
+        let minimum = grid > 0 ? grid : 1.0 / 16
+        let place = { (b: Double) in (b / step).rounded() * step }
+        let lastEnd = (chords.map { toBeats($0.end) } + notes.map { toBeats($0.end) }).max() ?? 0
+        let stopBars = max(1, (toBeats(end) / beatsPerBar).rounded())
+        let neededBars = ((lastEnd - 0.05) / beatsPerBar).rounded(.up)
+        let length = max(stopBars, neededBars) * beatsPerBar
         func span(_ s: Double, _ e: Double) -> (Double, Double)? {
-            let from = max(0, snap(toBeats(s)))
-            let to = min(length, max(from + quantum, snap(toBeats(e))))
+            let from = max(0, place(toBeats(s)))
+            let to = min(length, max(from + minimum, place(toBeats(e))))
             return from < length && to > from ? (from, to - from) : nil
         }
         let chordEvents = chords.compactMap { c -> LoopEvent? in
             guard let (from, len) = span(c.start, c.end) else { return nil }
             var e = LoopEvent(degree: c.degree, color: c.color, octave: c.octave, accidental: c.accidental, start: from, length: len)
             e.instrument = c.instrument.map { SoundRoute.parse($0).instrument }
+            e.velocity = c.velocity
             return e
         }
         let noteEvents = notes.compactMap { n -> LoopEvent? in
@@ -178,6 +189,10 @@ final class Loops: ObservableObject {
     @Published private(set) var loops: [Loop] = []
     @Published private(set) var recorderState = RecorderState.idle
     @Published private(set) var elapsedBeats = 0.0
+    /// Grid for new takes: 0 = as played (default), 0.25 = sixteenths, 0.5 = eighths.
+    @Published var recordQuantize = UserDefaults.standard.double(forKey: "recordQuantize") {
+        didSet { UserDefaults.standard.set(recordQuantize, forKey: "recordQuantize") }
+    }
     @Published var metronome = UserDefaults.standard.object(forKey: "metronome") as? Bool ?? true {
         didSet { UserDefaults.standard.set(metronome, forKey: "metronome") }
     }
@@ -196,7 +211,12 @@ final class Loops: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     // Recorder.
+    /// Wall-clock start of the take and its beat on the transport (a bar line).
     private var takeStart = 0.0
+    private var takeStartBeat = 0.0
+    /// Transport beat where the current take started (its bar 1), while recording.
+    var recordStartBeat: Double? { recorderState == .recording ? takeStartBeat : nil }
+    private var recorderJoined = false
     private var takeBpm = 110
     private var takeTonic = Note.c
     private var takeFlavor = Flavor.major
@@ -208,10 +228,15 @@ final class Loops: ObservableObject {
 
     // Player.
     private var playing: Loop?
-    private var position = 0.0
-    private var lastTick = 0.0
+    /// Transport beat where the loop's beat 0 falls (a bar line), and how far events are handed out.
+    private var anchorBeat = 0.0
+    private var scheduledBeat = 0.0
+    private var lastProgress = 0.0
     private var sounding = Set<Int>()
     private var playTimer: Timer?
+    /// Events go to the sound engine this far ahead with their exact time, so a main thread
+    /// busy drawing (measured p99 ≈ 45 ms) no longer delays them.
+    private static let lookahead = 0.06
 
     private static var fileURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -306,6 +331,14 @@ final class Loops: ObservableObject {
         persist()
     }
 
+    /// Opening a project: its loops replace these.
+    func replaceAll(_ new: [Loop]) {
+        stopPlayback()
+        loops = new
+        selectedId = new.first?.id
+        persist()
+    }
+
     func remove(_ id: String) {
         if playingId == id { stopPlayback() }
         loops.removeAll { $0.id == id }
@@ -357,7 +390,21 @@ final class Loops: ObservableObject {
 
     private func begin() {
         recorderState = .recording
-        takeStart = now()
+        // The take starts at the first note (it arrived a moment before this runs). With drums or
+        // a loop playing, it starts on their bar line instead, so the loop lines up with them; a
+        // note up to half a beat early still counts as that downbeat.
+        let first = (engine.heldChords().map(\.start) + engine.heldNotesPlayed().map(\.start)).min() ?? now()
+        // The recorder stays on the transport until the take ends, so drums stopped and restarted
+        // meanwhile keep the same grid.
+        if Transport.shared.isRunning {
+            let beat = Transport.shared.beat(at: first)
+            takeStartBeat = ((beat + 0.5) / LoopMath.beatsPerBar).rounded(.down) * LoopMath.beatsPerBar
+            _ = Transport.shared.join("recorder")
+        } else {
+            takeStartBeat = Transport.shared.join("recorder", downbeat: first)
+        }
+        recorderJoined = true
+        takeStart = Transport.shared.time(ofBeat: takeStartBeat)
         takeBpm = engine.bpm
         takeTonic = engine.tonic
         takeFlavor = engine.flavor
@@ -373,10 +420,14 @@ final class Loops: ObservableObject {
     }
 
     private func recordTick() {
-        let beatSeconds = 60 / Double(takeBpm)
-        elapsedBeats = (now() - takeStart) / beatSeconds
-        while Double(nextBeat) <= elapsedBeats {
-            if metronome { Synth.shared.click(accent: nextBeat % Int(LoopMath.beatsPerBar) == 0) }
+        let transport = Transport.shared.snapshot
+        let t = now()
+        elapsedBeats = max(0, transport.beat(at: t) - takeStartBeat)
+        // Clicks on the transport's beats, handed to the synth ahead with their exact time.
+        let horizon = transport.beat(at: t + Self.lookahead) - takeStartBeat
+        while Double(nextBeat) <= horizon {
+            let at = transport.time(ofBeat: takeStartBeat + Double(nextBeat))
+            if metronome, at > t - 0.03 { Synth.shared.click(accent: nextBeat % Int(LoopMath.beatsPerBar) == 0, at: at) }
             nextBeat += 1
         }
     }
@@ -385,7 +436,8 @@ final class Loops: ObservableObject {
         let end = now()
         let chords = (captured + engine.heldChords(end: end)).map {
             PlayedChord(degree: $0.degree, color: $0.color, octave: $0.octave, accidental: $0.accidental,
-                        start: max($0.start, takeStart), end: $0.end, instrument: $0.instrument)
+                        start: max($0.start, takeStart), end: $0.end, instrument: $0.instrument,
+                        velocity: $0.velocity)
         }
         let notes = (capturedNotes + engine.heldNotesPlayed(end: end)).map {
             PlayedNote(midi: $0.midi, velocity: $0.velocity, start: max($0.start, takeStart), end: $0.end,
@@ -394,7 +446,8 @@ final class Loops: ObservableObject {
         let start = takeStart, bpm = takeBpm, tonic = takeTonic, flavor = takeFlavor, instrument = takeInstrument
         resetRecorder()
         guard !chords.isEmpty || !notes.isEmpty else { return }
-        let (length, events) = LoopMath.build(chords, notes: notes, start: start, end: end, bpm: bpm)
+        let (length, events) = LoopMath.build(chords, notes: notes, start: start, end: end, bpm: bpm,
+                                              grid: recordQuantize)
         let loop = Loop(id: UUID().uuidString, name: nextName(), createdAt: Date(), bpm: bpm, tonic: tonic,
                         flavor: flavor, lengthBeats: length, events: events, instrument: instrument)
         loops.insert(loop, at: 0)
@@ -405,6 +458,8 @@ final class Loops: ObservableObject {
     private func resetRecorder() {
         recordTimer?.invalidate()
         recordTimer = nil
+        if recorderJoined { Transport.shared.leave("recorder") }
+        recorderJoined = false
         captured = []
         capturedNotes = []
         elapsedBeats = 0
@@ -420,20 +475,23 @@ final class Loops: ObservableObject {
         if playingId == loop.id { stopPlayback() } else { play(loop) }
     }
 
-    /// Plays in the key, mode and tempo it was recorded in; follows live changes after that.
+    /// Plays in the key, mode and tempo it was recorded in (the tempo only when nothing else is
+    /// playing: drums keep theirs); follows live changes after that. Starts on the next bar line
+    /// of whatever already plays.
     func play(_ loop: Loop) {
         stopPlayback()
         engine.tonic = loop.tonic
         engine.flavor = loop.flavor
-        engine.setBpm(loop.bpm)
+        if !Transport.shared.isRunning { engine.setBpm(loop.bpm) }
         for id in Set(loop.events.compactMap(\.instrument) + [loop.instrument ?? instruments.selectedId]) {
             _ = instruments.player(for: SoundRoute.make(id, bus: "loop:\(loop.id)"))
         }
         playing = loop
         playingId = loop.id
-        position = 0
-        lastTick = now()
-        let timer = Timer(timeInterval: 0.005, repeats: true) { [weak self] _ in
+        anchorBeat = Transport.shared.join("loops")
+        scheduledBeat = anchorBeat - 1e-9
+        lastProgress = 0
+        let timer = Timer(timeInterval: 0.01, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.playTick() }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -447,7 +505,10 @@ final class Loops: ObservableObject {
     func stopPlayback() {
         playTimer?.invalidate()
         playTimer = nil
-        if let loop = playing { for i in sounding { engine.endLoopChord(id: chordId(loop, i)) } }
+        if let loop = playing {
+            for i in sounding { engine.endLoopChord(id: chordId(loop, i)) }
+            Transport.shared.leave("loops")
+        }
         sounding.removeAll()
         playing = nil
         playingId = nil
@@ -456,35 +517,68 @@ final class Loops: ObservableObject {
 
     private func chordId(_ loop: Loop, _ index: Int) -> String { "loop:\(loop.id):\(index)" }
 
+    /// Hands out the loop's note-ons and note-offs that fall in the next `lookahead`, each with
+    /// its exact host time on the transport, and moves the progress bar (~30 per second).
     private func playTick() {
-        guard let loop = playing else { return }
+        guard let loop = playing, loop.lengthBeats > 0 else { return }
+        let transport = Transport.shared.snapshot
         let t = now()
-        position += (t - lastTick) * Double(engine.bpm) / 60
-        lastTick = t
-        position = position.truncatingRemainder(dividingBy: loop.lengthBeats)
-        progress = position / loop.lengthBeats
+        let nowBeat = transport.beat(at: t)
+        let length = loop.lengthBeats
+        let position = nowBeat < anchorBeat ? 0 : (nowBeat - anchorBeat).truncatingRemainder(dividingBy: length)
+        if abs(position / length - lastProgress) * length * 60 / transport.bpm > 1.0 / 30 || position / length < lastProgress {
+            lastProgress = position / length
+            progress = lastProgress
+        }
 
-        for (i, event) in loop.events.enumerated() where sounding.contains(i) {
-            if !(position >= event.start && position < event.start + event.length) {
-                engine.endLoopChord(id: chordId(loop, i))
-                sounding.remove(i)
+        // Main thread stalled for long (sleep, debugger): drop what was missed instead of piling it up.
+        if scheduledBeat < nowBeat - 1 { scheduledBeat = nowBeat }
+        let from = scheduledBeat, to = transport.beat(at: t + Self.lookahead)
+        guard to > from else { return }
+        scheduledBeat = to
+
+        // (beat, on?, index) in (from, to], offs before ons on the same beat.
+        var due: [(beat: Double, on: Bool, index: Int)] = []
+        let firstCycle = Int(((from - anchorBeat) / length).rounded(.down))
+        let lastCycle = Int(((to - anchorBeat) / length).rounded(.down))
+        if lastCycle >= 0 {
+            for cycle in max(0, firstCycle)...lastCycle {
+                let base = anchorBeat + Double(cycle) * length
+                for (i, event) in loop.events.enumerated() {
+                    let on = base + event.start, off = base + min(length, event.start + event.length)
+                    if on > from && on <= to { due.append((on, true, i)) }
+                    if off > from && off <= to { due.append((off, false, i)) }
+                }
             }
         }
-        for (i, event) in loop.events.enumerated() where !sounding.contains(i) {
-            if position >= event.start && position < event.start + event.length {
-                let instrument = SoundRoute.make(event.instrument ?? loop.instrument ?? instruments.selectedId,
-                                                 bus: "loop:\(loop.id)")
-                let velocity = max(1, Int((Double(event.velocity) * volume / 0.85).rounded()))
-                if let midi = event.midi {
-                    engine.startLoopNote(id: chordId(loop, i), midi: midi, velocity: min(127, velocity),
-                                         instrument: instrument)
-                } else {
-                    engine.startLoopChord(id: chordId(loop, i), degree: event.degree, color: event.color,
-                                          octave: event.octave, accidental: event.accidental, instrument: instrument,
-                                          velocity: min(127, velocity))
-                }
-                sounding.insert(i)
+        due.sort { $0.beat != $1.beat ? $0.beat < $1.beat : (!$0.on && $1.on) }
+
+        for item in due {
+            let at = transport.time(ofBeat: item.beat)
+            let event = loop.events[item.index]
+            if !item.on {
+                guard sounding.remove(item.index) != nil else { continue }
+                engine.endLoopChord(id: chordId(loop, item.index), at: at)
+                continue
             }
+            guard !sounding.contains(item.index) else { continue }
+            let instrument = SoundRoute.make(event.instrument ?? loop.instrument ?? instruments.selectedId,
+                                             bus: "loop:\(loop.id)")
+            // Volume is gain on the loop's sampler (velocity picks the sample layer, so scaling
+            // it changes the timbre); only the synth still takes volume through velocity.
+            let sampled = !InstrumentLibrary.isSynth(SoundRoute.parse(instrument).instrument)
+            instruments.player(for: instrument)?.setLevel(volume / 0.85)
+            let velocity = min(127, sampled ? event.velocity
+                                            : max(1, Int((Double(event.velocity) * volume / 0.85).rounded())))
+            if let midi = event.midi {
+                engine.startLoopNote(id: chordId(loop, item.index), midi: midi, velocity: velocity,
+                                     instrument: instrument, at: at)
+            } else {
+                engine.startLoopChord(id: chordId(loop, item.index), degree: event.degree, color: event.color,
+                                      octave: event.octave, accidental: event.accidental, instrument: instrument,
+                                      velocity: velocity, at: at)
+            }
+            sounding.insert(item.index)
         }
     }
 }

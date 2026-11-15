@@ -59,7 +59,6 @@ struct ChordDisplay: View {
             Canvas { context, size in
                 draw(context, size, at: now())
             }
-            .id(timeline.date)
         }
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 12))
         .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.line) }

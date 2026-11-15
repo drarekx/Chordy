@@ -55,6 +55,17 @@ private struct RecorderBar: View {
             Text(status).monospacedText(size: 12)
                 .foregroundStyle(loops.recorderState == .recording ? Theme.danger : Theme.text3)
             Spacer()
+            Menu {
+                Button(tr("Tal cual lo tocas")) { loops.recordQuantize = 0 }
+                Button(tr("Semicorcheas")) { loops.recordQuantize = 0.25 }
+                Button(tr("Corcheas")) { loops.recordQuantize = 0.5 }
+            } label: {
+                Text(loops.recordQuantize == 0 ? tr("Sin cuantizar") : (loops.recordQuantize == 0.25 ? "1/16" : "1/8"))
+                    .font(.system(size: 11))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help(tr("Cómo se encajan las notas al grabar"))
             Toggle(tr("Clic"), isOn: $loops.metronome)
                 .toggleStyle(.checkbox)
                 .help(tr("Metrónomo mientras grabas"))
@@ -89,6 +100,7 @@ private struct LoopRow: View {
     let toggleEditor: () -> Void
     @State private var renaming = false
     @State private var name = ""
+    @State private var confirmingDelete = false
 
     var body: some View {
         let playing = loops.playingId == loop.id
@@ -110,15 +122,29 @@ private struct LoopRow: View {
                             .help(tr("Doble clic para renombrar"))
                     }
                     Text("\(LoopMath.formatLength(loop.lengthBeats)) · \(loop.tonic.rawValue) \(loop.flavor.label) · \(loop.bpm) bpm"
-                         + (loop.instrument.map { " · " + ($0 == InstrumentLibrary.synthId ? tr("Sintetizador") : Instrument.with($0)?.name ?? "") } ?? ""))
+                         + (loop.instrument.map { " · " + Keyboards.soundName($0) } ?? ""))
                         .font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.text3)
                         .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 4)
-                IconButton(symbol: "slider.horizontal.3", label: tr("Editar: notas, acordes, tono, tempo y efectos")) { loops.studioId = loop.id }
+                IconButton(symbol: "slider.horizontal.3", label: tr("Editar: notas, acordes, tono, tempo y efectos")) {
+                    loops.studioId = loop.id
+                    UserDefaults.standard.set("editor", forKey: "mainMode")
+                }
                 IconButton(symbol: "plus.square.on.square", label: tr("Duplicar")) { loops.duplicate(loop.id) }
                 IconButton(symbol: "scissors", label: tr("Recortar"), kind: editing ? .primary : .ghost, action: toggleEditor)
-                IconButton(symbol: "trash", label: tr("Borrar")) { loops.remove(loop.id) }
+                IconButton(symbol: "trash", label: tr("Borrar")) { confirmingDelete = true }
+                    .confirmationDialog(tr("¿Borrar «%@»?", loop.name), isPresented: $confirmingDelete) {
+                        Button(tr("Borrar"), role: .destructive) {
+                            AppModel.shared.song.removeClips(of: loop.id)
+                            loops.remove(loop.id)
+                        }
+                        Button(tr("Cancelar"), role: .cancel) {}
+                    } message: {
+                        let uses = AppModel.shared.song.clips(of: loop.id)
+                        Text(uses > 0 ? tr("Se usa %d veces en la canción: también se quitará de allí. No se puede deshacer.", uses)
+                                      : tr("No se puede deshacer."))
+                    }
             }
             LoopPreview(events: loop.events, length: loop.lengthBeats, progress: playing ? loops.progress : nil)
                 .frame(height: 36)
@@ -132,11 +158,7 @@ private struct LoopRow: View {
                     .help(tr("Con efectos"))
             }
         }
-        .sheet(isPresented: Binding(get: { loops.studioId == loop.id }, set: { if !$0 { loops.studioId = nil } })) {
-            ThemedRoot {
-                LoopStudio(loops: loops, instruments: AppModel.shared.instruments, loop: loop) { loops.studioId = nil }
-            }
-        }
+
     }
 }
 

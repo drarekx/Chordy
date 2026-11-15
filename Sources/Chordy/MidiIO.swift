@@ -1,5 +1,7 @@
 import CoreMIDI
 import Foundation
+import QuartzCore
+import os
 
 /// CoreMIDI plumbing: listens to every source, publishes a virtual "Chordy" source
 /// (so DAWs can record what you play) and sends to devices (Launchkey LEDs).
@@ -10,9 +12,14 @@ final class MidiIO: @unchecked Sendable {
         let data1: UInt8
         let data2: UInt8
         let device: String
+        /// Host time it arrived (CoreMIDI thread), and whether `fastPath` already sounded it.
+        var time = 0.0
+        var presounded = false
     }
 
     var onMessage: ((Message) -> Void)?
+    /// Runs on the CoreMIDI thread before the hop to main; true = it sounded the message.
+    var fastPath: (@Sendable (UInt8, UInt8, UInt8, String) -> Bool)?
     var onDevicesChanged: (() -> Void)?
 
     private var client = MIDIClientRef()
@@ -20,7 +27,8 @@ final class MidiIO: @unchecked Sendable {
     private var outputPort = MIDIPortRef()
     private var virtualSource = MIDIEndpointRef()
     private var connected = Set<MIDIUniqueID>()
-    private var names: [MIDIUniqueID: String] = [:]
+    /// Device names, read on the CoreMIDI thread too.
+    private let names = OSAllocatedUnfairLock(initialState: [MIDIUniqueID: String]())
     private(set) var ready = false
 
     func start() {
@@ -42,7 +50,10 @@ final class MidiIO: @unchecked Sendable {
     }
 
     /// Display names of the connected inputs.
-    var inputNames: [String] { connected.compactMap { names[$0] }.sorted() }
+    var inputNames: [String] {
+        let names = self.names.withLock { $0 }
+        return connected.compactMap { names[$0] }.sorted()
+    }
 
     /// Connects new sources (hot-plug) and forgets removed ones.
     private func connectSources() {
@@ -55,7 +66,8 @@ final class MidiIO: @unchecked Sendable {
             // each would echo the other's notes forever.
             guard id != 0, id != ownId, !Self.isChordyOutput(source) else { continue }
             present.insert(id)
-            names[id] = Self.name(source)
+            let name = Self.name(source)
+            names.withLock { $0[id] = name }
             if !connected.contains(id) {
                 // The unique id rides along as refCon to know which device sent each message.
                 MIDIPortConnectSource(inputPort, source, UnsafeMutableRawPointer(bitPattern: Int(id)))
@@ -68,6 +80,7 @@ final class MidiIO: @unchecked Sendable {
 
     private func receive(_ list: UnsafePointer<MIDIEventList>, from refCon: UnsafeMutableRawPointer?) {
         let id = MIDIUniqueID(truncatingIfNeeded: Int(bitPattern: refCon))
+        let time = CACurrentMediaTime()
         var messages: [(UInt8, UInt8, UInt8)] = []
         for packet in list.unsafeSequence() {
             let count = Int(packet.pointee.wordCount)
@@ -82,12 +95,16 @@ final class MidiIO: @unchecked Sendable {
             }
         }
         guard !messages.isEmpty else { return }
+        let device = names.withLock { $0[id] } ?? "MIDI"
+        // Keys sound here, on the MIDI thread; the main thread only catches up with the UI.
+        let fast = fastPath
+        let out = messages.map { status, d1, d2 in
+            Message(status: status, data1: d1, data2: d2, device: device, time: time,
+                    presounded: fast?(status, d1, d2, device) ?? false)
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let device = self.names[id] ?? "MIDI"
-            for (status, d1, d2) in messages {
-                self.onMessage?(Message(status: status, data1: d1, data2: d2, device: device))
-            }
+            for message in out { self.onMessage?(message) }
         }
     }
 

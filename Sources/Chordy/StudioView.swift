@@ -23,7 +23,7 @@ struct StudioView: View {
     @AppStorage("mainMode") private var mode = Mode.studio
     @ObservedObject private var keyboards = AppModel.shared.keyboards
 
-    enum Mode: String { case studio, drums }
+    enum Mode: String { case studio, song, drums, synth, editor }
 
     enum SideTab: String, CaseIterable {
         case loops, chords, sound, midi
@@ -45,10 +45,16 @@ struct StudioView: View {
             Rectangle().fill(Theme.line).frame(height: 1)
             if mode == .drums {
                 DrumView(drums: model.drums, engine: model.engine)
+            } else if mode == .song {
+                SongView(song: model.song, loops: model.loops, drums: model.drums, engine: model.engine)
+            } else if mode == .synth {
+                SynthStudio(sounds: model.sounds, keyboards: model.keyboards, engine: model.engine)
+            } else if mode == .editor {
+                EditorHost(loops: model.loops, instruments: model.instruments, drums: model.drums) { mode = .studio }
             } else {
             HStack(alignment: .top, spacing: 16) {
                 VStack(spacing: 14) {
-                    KeyboardCards(keyboards: model.keyboards, midi: model.midi, engine: model.engine,
+                    KeyboardCards(keyboards: model.keyboards, midi: model.midi, devices: model.midi.devices, engine: model.engine,
                                   instruments: model.instruments, editing: $keyboards.editing)
                     SoundRoll(engine: model.engine, keyboards: model.keyboards)
                         .frame(minHeight: 150, maxHeight: .infinity)
@@ -90,67 +96,33 @@ struct StudioView: View {
 // MARK: - Header
 
 struct StudioHeader: View {
-    @ObservedObject var engine: ChordEngine
-    @ObservedObject var loops: Loops
-    @ObservedObject var drums: DrumMachine
-    @ObservedObject var keyboards: Keyboards
-    @ObservedObject var midi: MidiController
+    // Plain references: each piece below watches only what it shows, so a note or a drum
+    // step doesn't rebuild the whole header.
+    let engine: ChordEngine
+    let loops: Loops
+    let drums: DrumMachine
+    let keyboards: Keyboards
+    let midi: MidiController
     @Binding var mode: StudioView.Mode
 
     var body: some View {
         HStack(spacing: 14) {
-            SegmentedControl(options: [(tr("Estudio"), StudioView.Mode.studio), (tr("Batería"), .drums)], selection: $mode)
-                .fixedSize()
+            ProjectMenu(projects: AppModel.shared.projects)
                 .padding(.leading, 64)
+            SegmentedControl(options: [(tr("Estudio"), StudioView.Mode.studio), (tr("Canción"), .song), (tr("Batería"), .drums),
+                                       (tr("Sintetizador"), .synth)], selection: $mode)
+                .fixedSize()
                 .background {
                     Button("") { mode = mode == .drums ? .studio : .drums }
                         .keyboardShortcut("b", modifiers: .command)
                         .opacity(0)
                 }
                 .help(tr("Estudio o batería a pantalla completa (⌘B)"))
-            HStack(spacing: 6) {
-                IconButton(symbol: loops.isPlaying || drums.playing ? "pause.fill" : "play.fill",
-                           label: tr("Reproducir loop y batería (P)"), kind: .secondary) { playAll() }
-                IconButton(symbol: "record.circle", label: mode == .drums ? tr("Grabar batería tocando los pads") : tr("Grabar loop (R)"),
-                           kind: (mode == .drums ? drums.recording : loops.isRecording) ? .primary : .secondary) {
-                    mode == .drums ? drums.toggleRecord() : loops.toggleRecord()
-                }
-                IconButton(symbol: "stop.fill", label: tr("Parar todo (Esc)"), kind: .secondary) { stopAll() }
-            }
-
-            VStack(alignment: .leading, spacing: 0) {
-                Text(engine.headline.isEmpty ? tr("Toca algo") : engine.headline.joined(separator: " · "))
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(engine.headline.isEmpty ? Theme.text3 : Theme.text)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            pill {
-                Text(tr("Tono")).font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.text3)
-                IconButton(symbol: "chevron.left", label: tr("Tono anterior (Z)"), size: 22) { engine.shiftTonic(-1) }
-                Menu {
-                    ForEach(Flavor.allCases, id: \.self) { flavor in
-                        Button(flavor.label) { engine.flavor = flavor }
-                    }
-                } label: {
-                    Text("\(engine.tonic.rawValue) \(engine.flavor.label)").monospacedText(size: 13)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                IconButton(symbol: "chevron.right", label: tr("Tono siguiente (C)"), size: 22) { engine.shiftTonic(1) }
-            }
-            pill {
-                Text(tr("Tempo")).font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.text3)
-                IconButton(symbol: "minus", label: tr("Más lento (−)"), size: 22) { engine.setBpm(engine.bpm - 1) }
-                Text("\(engine.bpm)").monospacedText(size: 13).frame(minWidth: 28)
-                IconButton(symbol: "plus", label: tr("Más rápido (+)"), size: 22) { engine.setBpm(engine.bpm + 1) }
-            }
-            HStack(spacing: 6) {
-                Circle().fill(connectedCount > 0 ? Theme.ok : Theme.text3).frame(width: 7, height: 7)
-                Text(tr("%d teclados", connectedCount)).font(.system(size: 11)).foregroundStyle(Theme.text2)
-            }
+            TransportButtons(loops: loops, drums: drums, engine: engine, mode: mode)
+            BeatIndicator(loops: loops, drums: drums)
+            Headline(engine: engine).frame(maxWidth: .infinity, alignment: .leading)
+            KeyAndTempo(engine: engine)
+            ConnectedBadge(keyboards: keyboards, devices: midi.devices)
             IconButton(symbol: "arrow.up.left.and.arrow.down.right", label: tr("Pantalla completa")) {
                 NSApp.keyWindow?.toggleFullScreen(nil)
             }
@@ -160,18 +132,87 @@ struct StudioHeader: View {
         .padding(.bottom, 10)
         .background(Theme.sidebar)
     }
+}
 
-    private var connectedCount: Int {
-        keyboards.configs.filter { midi.inputs.contains($0.device) }.count
+/// The loop editor as a mode: shows the loop chosen with «Editar», or a hint.
+private struct EditorHost: View {
+    @ObservedObject var loops: Loops
+    let instruments: InstrumentLibrary
+    let drums: DrumMachine
+    let back: () -> Void
+
+    var body: some View {
+        if let id = loops.studioId, let loop = loops.loops.first(where: { $0.id == id }) {
+            LoopStudio(loops: loops, instruments: instruments, drums: drums, loop: loop) {
+                loops.studioId = nil
+                back()
+            }
+            .id(id)
+        } else {
+            VStack(spacing: 10) {
+                Text(tr("Elige un loop y pulsa «Editar»")).font(.system(size: 15, weight: .semibold))
+                Button(tr("Volver al estudio"), action: back).buttonStyle(.appSecondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
+}
 
-    private func pill<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-        HStack(spacing: 4) { content() }
-            .fixedSize()
-            .padding(.horizontal, 10)
-            .frame(height: 32)
-            .background(Theme.card, in: RoundedRectangle(cornerRadius: Theme.radius))
-            .overlay { RoundedRectangle(cornerRadius: Theme.radius).strokeBorder(Theme.line) }
+/// Project name (● when edited) with New, Open, recent, Save and Save as.
+private struct ProjectMenu: View {
+    @ObservedObject var projects: Projects
+
+    var body: some View {
+        Menu {
+            Button(tr("Nuevo proyecto")) { projects.newProject() }
+            Button(tr("Abrir…")) { projects.open() }
+            if !projects.recent.isEmpty {
+                Menu(tr("Recientes")) {
+                    ForEach(projects.recent, id: \.self) { u in
+                        Button(u.deletingPathExtension().lastPathComponent) { projects.openRecent(u) }
+                    }
+                }
+            }
+            Divider()
+            Button(tr("Guardar")) { projects.save() }
+            Button(tr("Guardar como…")) { projects.saveAs() }
+        } label: {
+            HStack(spacing: 5) {
+                if projects.dirty { Circle().fill(Theme.warn).frame(width: 6, height: 6) }
+                Text(projects.name).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(projects.dirty ? tr("Hay cambios sin guardar (se autoguardan cada 30 s)") : tr("Proyecto guardado"))
+        .background {
+            Group {
+                Button("") { projects.newProject() }.keyboardShortcut("n", modifiers: .command)
+                Button("") { projects.open() }.keyboardShortcut("o", modifiers: .command)
+                Button("") { projects.save() }.keyboardShortcut("s", modifiers: .command)
+                Button("") { projects.saveAs() }.keyboardShortcut("s", modifiers: [.command, .shift])
+            }
+            .opacity(0)
+        }
+    }
+}
+
+private struct TransportButtons: View {
+    @ObservedObject var loops: Loops
+    @ObservedObject var drums: DrumMachine
+    let engine: ChordEngine
+    let mode: StudioView.Mode
+
+    var body: some View {
+        HStack(spacing: 6) {
+            IconButton(symbol: loops.isPlaying || drums.playing ? "pause.fill" : "play.fill",
+                       label: tr("Reproducir loop y batería (P)"), kind: .secondary) { playAll() }
+            IconButton(symbol: "record.circle", label: mode == .drums ? tr("Grabar batería tocando los pads") : tr("Grabar loop (R)"),
+                       kind: (mode == .drums ? drums.recording : loops.isRecording) ? .primary : .secondary) {
+                mode == .drums ? drums.toggleRecord() : loops.toggleRecord()
+            }
+            IconButton(symbol: "stop.fill", label: tr("Parar todo (Esc)"), kind: .secondary) { stopAll() }
+        }
     }
 
     private func playAll() {
@@ -192,12 +233,140 @@ struct StudioHeader: View {
     }
 }
 
+/// 1 · 2 · 3 · 4 and the bar while anything plays; red while recording. Counts from the take's
+/// first bar when a loop is recording.
+struct BeatIndicator: View {
+    @ObservedObject private var clock = BeatClock.shared
+    @ObservedObject var loops: Loops
+    @ObservedObject var drums: DrumMachine
+
+    var body: some View {
+        let recording = loops.recorderState == .recording || drums.recording
+        Group {
+            if loops.recorderState == .armed {
+                Label(tr("Toca para empezar a grabar"), systemImage: "record.circle")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.danger)
+            } else if let position = BeatIndicator.position(beat: clock.beat, takeStart: loops.recordStartBeat) {
+                HStack(spacing: 4) {
+                    ForEach(0..<4, id: \.self) { i in
+                        let on = i == position.inBar
+                        Text("\(i + 1)")
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .frame(width: 30, height: 30)
+                            .foregroundStyle(on ? Theme.window : Theme.text3)
+                            .background(on ? (recording ? Theme.danger : Theme.accentFill) : Theme.field,
+                                        in: RoundedRectangle(cornerRadius: 7))
+                    }
+                    Text(tr("Compás %d", position.bar))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(recording ? Theme.danger : Theme.text2)
+                        .frame(minWidth: 70, alignment: .leading)
+                        .padding(.leading, 4)
+                }
+            }
+        }
+        .fixedSize()
+    }
+
+    /// Beat in the bar (0…3) and bar number (from 1) for a transport beat.
+    static func position(beat: Int?, takeStart: Double?) -> (inBar: Int, bar: Int)? {
+        guard let beat else { return nil }
+        let relative = max(0, beat - Int(takeStart ?? 0))
+        return (relative % 4, relative / 4 + 1)
+    }
+}
+
+private struct Headline: View {
+    @ObservedObject var engine: ChordEngine
+
+    var body: some View {
+        Text(engine.headline.isEmpty ? tr("Toca algo") : engine.headline.joined(separator: " · "))
+            .font(.system(size: 22, weight: .bold))
+            .foregroundStyle(engine.headline.isEmpty ? Theme.text3 : Theme.text)
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+    }
+}
+
+/// Key and tempo: rebuilt only when they change, not on every note.
+private struct KeyAndTempo: View {
+    let engine: ChordEngine
+    @State private var tonic = Note.c
+    @State private var flavor = Flavor.major
+    @State private var bpm = 110
+    @State private var chordType = ChordColor.diatonic
+
+    var body: some View {
+        HStack(spacing: 14) {
+            pill {
+                Text(tr("Acorde")).font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.text3)
+                Menu {
+                    ChordTypeMenuItems(selected: chordType) { engine.chordType = $0 }
+                } label: {
+                    Text(chordType.name).monospacedText(size: 13)
+                        .foregroundStyle(chordType == .diatonic ? Theme.text : Theme.accentText)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help(tr("Tipo de los acordes que tocas (mantener W A S D o los pads de color lo cambia un momento)"))
+            }
+            pill {
+                Text(tr("Tono")).font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.text3)
+                IconButton(symbol: "chevron.left", label: tr("Tono anterior (Z)"), size: 22) { engine.shiftTonic(-1) }
+                Menu {
+                    ForEach(Flavor.allCases, id: \.self) { f in Button(f.label) { engine.flavor = f } }
+                } label: {
+                    Text("\(tonic.rawValue) \(flavor.label)").monospacedText(size: 13)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                IconButton(symbol: "chevron.right", label: tr("Tono siguiente (C)"), size: 22) { engine.shiftTonic(1) }
+            }
+            pill {
+                Text(tr("Tempo")).font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.text3)
+                IconButton(symbol: "minus", label: tr("Más lento (−)"), size: 22) { engine.setBpm(engine.bpm - 1) }
+                Text("\(bpm)").monospacedText(size: 13).frame(minWidth: 28)
+                IconButton(symbol: "plus", label: tr("Más rápido (+)"), size: 22) { engine.setBpm(engine.bpm + 1) }
+            }
+        }
+        .onReceive(engine.$tonic.removeDuplicates()) { tonic = $0 }
+        .onReceive(engine.$flavor.removeDuplicates()) { flavor = $0 }
+        .onReceive(engine.$bpm.removeDuplicates()) { bpm = $0 }
+        .onReceive(engine.$chordType.removeDuplicates()) { chordType = $0 }
+    }
+
+    private func pill<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        HStack(spacing: 4) { content() }
+            .fixedSize()
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: Theme.radius))
+            .overlay { RoundedRectangle(cornerRadius: Theme.radius).strokeBorder(Theme.line) }
+    }
+}
+
+private struct ConnectedBadge: View {
+    @ObservedObject var keyboards: Keyboards
+    @ObservedObject var devices: DeviceList
+
+    var body: some View {
+        let count = keyboards.configs.filter { devices.names.contains($0.device) }.count
+        HStack(spacing: 6) {
+            Circle().fill(count > 0 ? Theme.ok : Theme.text3).frame(width: 7, height: 7)
+            Text(tr("%d teclados", count)).font(.system(size: 11)).foregroundStyle(Theme.text2)
+        }
+    }
+}
+
 // MARK: - Keyboard cards
 
 struct KeyboardCards: View {
     @ObservedObject var keyboards: Keyboards
-    @ObservedObject var midi: MidiController
-    @ObservedObject var engine: ChordEngine
+    let midi: MidiController
+    @ObservedObject var devices: DeviceList
+    /// Not observed: the keybeds inside watch the engine themselves.
+    let engine: ChordEngine
     @ObservedObject var instruments: InstrumentLibrary
     @Binding var editing: String?
 
@@ -213,7 +382,7 @@ struct KeyboardCards: View {
             .background(Theme.card, in: RoundedRectangle(cornerRadius: 12))
         } else {
             let cards = ForEach(keyboards.configs) { config in
-                KeyboardCard(config: config, connected: midi.inputs.contains(config.device), keyboards: keyboards,
+                KeyboardCard(config: config, connected: devices.names.contains(config.device), keyboards: keyboards,
                              engine: engine, instruments: instruments) { editing = config.id }
                     .frame(maxWidth: .infinity)
             }
@@ -230,7 +399,7 @@ struct KeyboardCard: View {
     let config: KeyboardConfig
     let connected: Bool
     @ObservedObject var keyboards: Keyboards
-    @ObservedObject var engine: ChordEngine
+    let engine: ChordEngine
     @ObservedObject var instruments: InstrumentLibrary
     let configure: () -> Void
 
@@ -325,7 +494,11 @@ struct KeyboardCard: View {
         .help(tr("Clic: este sonido · clic derecho: cambiar la casilla"))
         .contextMenu {
             Text(tr("Poner en la casilla %d", slot + 1))
-            Button(tr("Sintetizador")) { keyboards.setFavorite(slot, to: InstrumentLibrary.synthId) }
+            Menu(tr("Sintetizador")) {
+                ForEach(AppModel.shared.sounds.all) { p in
+                    Button(p.name) { keyboards.setFavorite(slot, to: InstrumentLibrary.synth(p.id)) }
+                }
+            }
             ForEach(Instrument.Group.allCases, id: \.self) { group in
                 Menu(group.title) {
                     ForEach(Instrument.all.filter { $0.group == group }) { instrument in
@@ -341,12 +514,16 @@ struct KeyboardCard: View {
 /// show their size and download when picked.
 struct InstrumentMenu: View {
     @ObservedObject var instruments: InstrumentLibrary
+    @ObservedObject private var sounds = AppModel.shared.sounds
     let selected: String
     let pick: (String) -> Void
 
     var body: some View {
         Menu {
-            Button(tr("Sintetizador")) { pick(InstrumentLibrary.synthId) }
+            Section(tr("Sintetizador")) {
+                ForEach(sounds.all) { p in Button(p.name) { pick(InstrumentLibrary.synth(p.id)) } }
+                Button(tr("Crear o editar sonidos…")) { UserDefaults.standard.set("synth", forKey: "mainMode") }
+            }
             ForEach(Instrument.Group.allCases, id: \.self) { group in
                 Section(group.title) {
                     ForEach(Instrument.all.filter { $0.group == group }) { instrument in
@@ -372,7 +549,7 @@ struct InstrumentMenu: View {
     }
 
     private var name: String {
-        selected == InstrumentLibrary.synthId ? tr("Sintetizador") : Instrument.with(selected)?.name ?? tr("Sintetizador")
+        Keyboards.soundName(selected)
     }
 
     private func title(_ instrument: Instrument) -> String {
@@ -536,13 +713,22 @@ struct SoundRoll: View {
     @ObservedObject var keyboards: Keyboards
 
     var body: some View {
-        TimelineView(.animation) { timeline in
+        // Only the canvas redraws (no `.id(date)`: that re-laid out the whole window every
+        // frame and kept the main thread, where MIDI and loops run, busy), and it pauses
+        // when nothing is on screen.
+        TimelineView(.animation(minimumInterval: 1.0 / 60, paused: idle)) { timeline in
             Canvas { context, size in draw(context, size, at: now()) }
-                .id(timeline.date)
         }
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 12))
         .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.line) }
         .accessibilityLabel(tr("Lo que suena"))
+    }
+
+    /// Nothing sounding and nothing left scrolling across the window.
+    private var idle: Bool {
+        let start = now() - engine.windowSeconds
+        return engine.sounding.isEmpty && engine.heldNotes.isEmpty
+            && !engine.history.contains { $0.end >= start } && !engine.noteHistory.contains { $0.end >= start }
     }
 
     private func draw(_ context: GraphicsContext, _ size: CGSize, at time: Double) {
@@ -648,5 +834,24 @@ struct ChordsTab: View {
                 .font(.system(size: 11)).foregroundStyle(Theme.text3)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+/// Chord types for a menu: the key's own chords first, then the fixed qualities.
+struct ChordTypeMenuItems: View {
+    let selected: ChordColor
+    let pick: (ChordColor) -> Void
+
+    var body: some View {
+        Button { pick(.diatonic) } label: { item(.diatonic, tr("Del tono (I, ii, iii…)")) }
+        Divider()
+        ForEach([ChordColor.major, .minor, .diminished, .augmented], id: \.self) { c in Button { pick(c) } label: { item(c, c.name) } }
+        Divider()
+        ForEach([ChordColor.seventh, .minor7, .maj7, .sus2, .sus4, .add9], id: \.self) { c in Button { pick(c) } label: { item(c, c.name) } }
+    }
+
+    @ViewBuilder
+    private func item(_ c: ChordColor, _ title: String) -> some View {
+        if c == selected { Label(title, systemImage: "checkmark") } else { Text(title) }
     }
 }

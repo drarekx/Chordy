@@ -34,6 +34,36 @@ final class SoundLibrary: ObservableObject {
     }
 
     var all: [Patch] { Patch.builtins + userPatches }
+
+    /// The sound a synth note uses: the one being edited (with its unsaved edits, so keyboards
+    /// that play it hear the editing live) or a saved one; unknown ids fall back to the draft.
+    func patch(for id: String?) -> Patch {
+        guard let id, id != selectedId else { return draft }
+        return all.first { $0.id == id } ?? draft
+    }
+
+    func name(of id: String) -> String { all.first { $0.id == id }?.name ?? tr("Sintetizador") }
+
+    /// A new sound to start from: a copy of the plain saw.
+    func newSound() {
+        var patch = Patch.builtins[0]
+        patch.id = "user:\(UUID().uuidString)"
+        patch.name = tr("Sonido nuevo")
+        userPatches.append(patch)
+        persist()
+        select(patch.id)
+    }
+
+    /// Copy of any sound (factory or own), selected for editing.
+    func duplicate(_ id: String) {
+        guard var patch = all.first(where: { $0.id == id }) else { return }
+        if id == selectedId { patch = draft }
+        patch.id = "user:\(UUID().uuidString)"
+        patch.name = String(tr("%@ (copia)", patch.name).prefix(40))
+        userPatches.append(patch)
+        persist()
+        select(patch.id)
+    }
     var selected: Patch { all.first { $0.id == selectedId } ?? Patch.builtins[0] }
     /// The draft differs from the saved sound.
     var dirty: Bool { draft != selected }
@@ -66,6 +96,15 @@ final class SoundLibrary: ObservableObject {
         }
         persist()
         select(patch.id)
+    }
+
+    /// Opening a project: its own synth sounds join (same ids are replaced).
+    func merge(_ patches: [Patch]) {
+        for p in patches where !p.isBuiltin {
+            if let i = userPatches.firstIndex(where: { $0.id == p.id }) { userPatches[i] = p } else { userPatches.append(p) }
+        }
+        persist()
+        if let current = all.first(where: { $0.id == selectedId }) { draft = current }
     }
 
     func rename(_ id: String, to name: String) {

@@ -11,9 +11,12 @@ final class AppModel: ObservableObject {
     let instruments = InstrumentLibrary()
     let keyboards: Keyboards
     let drums: DrumMachine
+    let remote: RemoteServer
     let keyboard: KeyboardInput
     let midi: MidiController
     let loops: Loops
+    let song: Song
+    private(set) lazy var projects = Projects(model: self)
 
     private init() {
         keyboard = KeyboardInput(engine: engine)
@@ -26,7 +29,7 @@ final class AppModel: ObservableObject {
             if bus.hasPrefix("loop:") { return loops.effects(for: String(bus.dropFirst(5))) }
             return nil
         }
-        engine.output = SoundOutput(instruments: instruments, patch: { [unowned sounds] in sounds.draft })
+        engine.output = SoundOutput(instruments: instruments, patch: { [unowned sounds] id in sounds.patch(for: id) })
         let shortcuts = KeyboardInput.Shortcuts(
             toggleRecord: { [unowned loops] in loops.toggleRecord() },
             togglePlay: { [unowned loops] in loops.togglePlay() },
@@ -38,6 +41,9 @@ final class AppModel: ObservableObject {
         midi.isPlaying = { [unowned loops] in loops.isPlaying }
         midi.watch(loops.objectWillChange)
         midi.watch(drums.objectWillChange)
+        remote = RemoteServer(drums: drums, engine: engine, keyboards: keyboards, loops: loops,
+                              midi: midi, sounds: sounds, instruments: instruments)
+        song = Song(engine: engine, loops: loops, drums: drums, instruments: instruments)
     }
 
     func start() {
@@ -45,9 +51,12 @@ final class AppModel: ObservableObject {
         instruments.restore()
         keyboard.start()
         midi.start()
+        remote.start()
+        projects.start()
     }
 
     func stop() {
+        projects.saveOnQuit()
         midi.stop()
     }
 }

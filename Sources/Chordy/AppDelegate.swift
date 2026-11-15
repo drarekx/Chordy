@@ -278,7 +278,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case "drums": AppModel.shared.drums.togglePlay()
                 case let command? where command.hasPrefix("mode:"):
                     UserDefaults.standard.set(String(command.dropFirst(5)), forKey: "mainMode")
-                case "editloop": AppModel.shared.loops.studioId = AppModel.shared.loops.loops.first?.id
+                case let command? where command.hasPrefix("chordtype:"):
+                    // chordtype:<diatonic|major|minor|7|m7|…> sets the header chord type.
+                    if let c = ChordColor(rawValue: String(command.dropFirst(10))) { AppModel.shared.engine.chordType = c }
+                case let command? where command.hasPrefix("synthslots:"):
+                    try? Synth.shared.debugSlots().write(toFile: String(command.dropFirst(11)), atomically: true, encoding: .utf8)
+                case "editloop":
+                    AppModel.shared.loops.studioId = AppModel.shared.loops.loops.first?.id
+                    UserDefaults.standard.set("editor", forKey: "mainMode")
+                case let command? where command.hasPrefix("songdemo"):
+                    // songdemo: drums A on bars 1–4 and the first loop on bars 1–4 (for testing).
+                    let song = AppModel.shared.song
+                    if let drumTrack = song.data.tracks.first(where: { $0.isDrums }) { song.add(.drums(0), track: drumTrack.id, at: 0) }
+                    if let loop = AppModel.shared.loops.loops.first, let t = song.data.tracks.first(where: { !$0.isDrums }) {
+                        song.add(.loop(loop.id), track: t.id, at: 0)
+                    }
+                case "songsections":
+                    let song = AppModel.shared.song
+                    song.addSection(at: 0); song.addSection(at: 4)
+                case "songplay": AppModel.shared.song.togglePlay()
                 case "devices":
                     // Toggle the device drawing on every keyboard card.
                     let kb = AppModel.shared.keyboards

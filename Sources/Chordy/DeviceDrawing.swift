@@ -5,9 +5,47 @@ import SwiftUI
 /// after the real ones; any other keyboard gets a plain keybed.
 struct DeviceDrawing: View {
     let config: KeyboardConfig
-    @ObservedObject var midi: MidiController
+    let midi: MidiController
+    let engine: ChordEngine
+    let drums: DrumMachine
+
+    var body: some View {
+        if config.device.localizedCaseInsensitiveContains("launchkey") {
+            LaunchkeyCanvas(config: config, midi: midi, live: midi.live, engine: engine, drums: drums)
+        } else {
+            KeybedCanvas(config: config, midi: midi, live: midi.live, engine: engine, drums: drums)
+        }
+    }
+}
+
+/// The Launchkey also shows the pads, so it follows the drum machine.
+private struct LaunchkeyCanvas: View {
+    let config: KeyboardConfig
+    let midi: MidiController
+    @ObservedObject var live: LiveMIDI
     @ObservedObject var engine: ChordEngine
     @ObservedObject var drums: DrumMachine
+
+    var body: some View { DevicePainter(config: config, midi: midi, live: live, drums: drums).view }
+}
+
+/// Keyboards without pads only redraw for their keys (and key/mode changes).
+private struct KeybedCanvas: View {
+    let config: KeyboardConfig
+    let midi: MidiController
+    @ObservedObject var live: LiveMIDI
+    @ObservedObject var engine: ChordEngine
+    let drums: DrumMachine
+
+    var body: some View { DevicePainter(config: config, midi: midi, live: live, drums: drums).view }
+}
+
+@MainActor
+private struct DevicePainter {
+    let config: KeyboardConfig
+    let midi: MidiController
+    let live: LiveMIDI
+    let drums: DrumMachine
 
     enum Model { case launchkey25, psrE453, generic }
 
@@ -25,7 +63,7 @@ struct DeviceDrawing: View {
         }
     }
 
-    var body: some View {
+    var view: some View {
         Canvas { context, size in
             switch model {
             case .launchkey25: drawLaunchkey(context, size)
@@ -50,7 +88,7 @@ struct DeviceDrawing: View {
     /// White and black keys from `low` to `high`, lit by what this device holds.
     private func drawKeybed(_ context: GraphicsContext, _ r: CGRect, low: Int, high: Int) {
         let black: Set<Int> = [1, 3, 6, 8, 10]
-        let held = midi.liveNotes[device] ?? []
+        let held = live.notes[device] ?? []
         let from = black.contains(low % 12) ? low - 1 : low
         let to = black.contains(high % 12) ? high + 1 : high
         let whites = (from...to).filter { !black.contains($0 % 12) }
@@ -141,8 +179,8 @@ struct DeviceDrawing: View {
         for (i, t) in track.enumerated() {
             let r = CGRect(x: W * 0.04 + CGFloat(i) * (bw + W * 0.012), y: H * 0.19, width: bw, height: bh)
             let control = MidiControl(.cc, channel: 1, number: t.1)
-            let pressed = midi.isPressed(device, control) || midi.isPressed(device + "", MidiControl(.cc, channel: 16, number: t.1))
-                || midi.isPressed("Launchkey MK2 25 Launchkey InControl", MidiControl(.cc, channel: 16, number: t.1))
+            let pressed = live.isPressed(device, control) || live.isPressed(device + "", MidiControl(.cc, channel: 16, number: t.1))
+                || live.isPressed("Launchkey MK2 25 Launchkey InControl", MidiControl(.cc, channel: 16, number: t.1))
             button(context, r, label: t.0, pressed: pressed, mapped: drums.padMode == .chords ? tr("sonido") : tr("pista"))
         }
         let transport: [(String, Int)] = [("◀◀", 112), ("▶▶", 113), ("■", 114), ("▶", 115), ("⟲", 116), ("●", 117)]
@@ -150,7 +188,7 @@ struct DeviceDrawing: View {
             let col = i % 3, row = i / 3
             let r = CGRect(x: W * 0.04 + CGFloat(col) * (bw + W * 0.012), y: H * (0.31 + CGFloat(row) * 0.12), width: bw, height: bh)
             let ids = [MidiControl(.cc, channel: 1, number: t.1), MidiControl(.cc, channel: 16, number: t.1)]
-            let pressed = ids.contains { c in midi.livePressed.contains { $0.hasSuffix("|\(c.id)") } }
+            let pressed = ids.contains { c in live.pressed.contains { $0.hasSuffix("|\(c.id)") } }
             let mapped = ids.compactMap { midi.bindings[$0.id] }.first.map(MidiController.shortLabel)
             button(context, r, label: t.0, pressed: pressed, mapped: mapped)
         }
@@ -165,7 +203,7 @@ struct DeviceDrawing: View {
                 let l = a.label
                 return l.count > 10 ? String(l.prefix(9)) + "…" : l
             }
-            knob(context, center: center, radius: min(cell * 0.3, H * 0.045), value: midi.value(device, control), label: mapped)
+            knob(context, center: center, radius: min(cell * 0.3, H * 0.045), value: live.value(device, control), label: mapped)
         }
 
         // Pads (16) and the two round buttons.
@@ -176,7 +214,7 @@ struct DeviceDrawing: View {
                            width: padSize, height: padSize)
             let inControl = row == 0 ? MidiPresets.inControlTop[col] : MidiPresets.inControlBottom[col]
             let basic = row == 0 ? MidiPresets.basicTop[col] : MidiPresets.basicBottom[col]
-            let pressed = midi.livePressed.contains { k in
+            let pressed = live.pressed.contains { k in
                 k.hasSuffix("|" + MidiControl(.note, channel: 1, number: inControl).id) && k.localizedCaseInsensitiveContains("incontrol")
                     || k.hasSuffix("|" + MidiControl(.note, channel: 10, number: basic).id)
             }
@@ -194,7 +232,7 @@ struct DeviceDrawing: View {
             let note = row == 0 ? MidiPresets.roundTop : MidiPresets.roundBottom
             let control = MidiControl(.note, channel: 1, number: note)
             let r = CGRect(x: padRight + W * 0.025, y: H * (0.25 + CGFloat(row) * 0.14) + padSize * 0.2, width: padSize * 0.6, height: padSize * 0.6)
-            let pressed = midi.livePressed.contains { $0.hasSuffix("|" + control.id) && $0.localizedCaseInsensitiveContains("incontrol") }
+            let pressed = live.pressed.contains { $0.hasSuffix("|" + control.id) && $0.localizedCaseInsensitiveContains("incontrol") }
             button(context, r, label: "", pressed: pressed, mapped: midi.bindings[control.id].map(MidiController.shortLabel), round: true)
         }
         text(context, padModeName, CGPoint(x: padLeft, y: H * 0.535), size: H * 0.03, color: Color(white: 0.6), anchor: .leading)
@@ -203,11 +241,11 @@ struct DeviceDrawing: View {
         let ob = CGRect(x: W * 0.04, y: H * 0.56, width: bw, height: bh)
         button(context, ob, label: "−", pressed: false)
         button(context, ob.offsetBy(dx: bw + W * 0.012, dy: 0), label: "+", pressed: false)
-        let base = midi.keyWindow[device] ?? 48
+        let base = live.keyWindow[device] ?? 48
         text(context, tr("Octava %@", octaveName(base)), CGPoint(x: W * 0.04, y: H * 0.67), size: H * 0.028,
              color: Color(white: 0.6), anchor: .leading)
-        let pb = midi.value(device, MidiControl(.pb, channel: 1, number: 0)) ?? 0.5
-        let mod = midi.value(device, MidiControl(.cc, channel: 1, number: 1)) ?? 0
+        let pb = live.value(device, MidiControl(.pb, channel: 1, number: 0)) ?? 0.5
+        let mod = live.value(device, MidiControl(.cc, channel: 1, number: 1)) ?? 0
         wheel(context, CGRect(x: W * 0.045, y: H * 0.72, width: W * 0.035, height: H * 0.2), value: pb, label: "PITCH")
         wheel(context, CGRect(x: W * 0.1, y: H * 0.72, width: W * 0.035, height: H * 0.2), value: mod, label: "MOD")
         drawKeybed(context, CGRect(x: W * 0.17, y: H * 0.58, width: W * 0.8, height: H * 0.38), low: base, high: base + 24)
@@ -280,7 +318,7 @@ struct DeviceDrawing: View {
              color: Color(white: 0.55), anchor: .leading)
 
         // Pitch bend wheel and the 61 keys (C2–C7 as MIDI 36–96).
-        let pb = midi.value(device, MidiControl(.pb, channel: 1, number: 0)) ?? 0.5
+        let pb = live.value(device, MidiControl(.pb, channel: 1, number: 0)) ?? 0.5
         wheel(context, CGRect(x: W * 0.025, y: H * 0.55, width: W * 0.022, height: H * 0.3), value: pb, label: "PITCH")
         drawKeybed(context, CGRect(x: W * 0.06, y: H * 0.47, width: W * 0.92, height: H * 0.48), low: 36, high: 96)
     }

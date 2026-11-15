@@ -1,6 +1,8 @@
 import AVFoundation
 import Combine
 import Foundation
+import QuartzCore
+import os
 
 // MARK: - Catalog
 
@@ -134,6 +136,11 @@ final class InstrumentLibrary: NSObject, ObservableObject, URLSessionDownloadDel
 
     nonisolated static let synthId = "synth"
 
+    /// "synth" (the sound being edited) or "synth:<patch id>" (a saved synth sound).
+    nonisolated static func isSynth(_ id: String) -> Bool { id == synthId || id.hasPrefix("synth:") }
+    nonisolated static func synthPatchId(_ id: String) -> String? { id.hasPrefix("synth:") ? String(id.dropFirst(6)) : nil }
+    nonisolated static func synth(_ patchId: String) -> String { "synth:\(patchId)" }
+
     /// `synthId` or an `Instrument.id`.
     @Published private(set) var selectedId: String
     @Published private(set) var states: [String: PackState] = [:]
@@ -194,6 +201,7 @@ final class InstrumentLibrary: NSObject, ObservableObject, URLSessionDownloadDel
               fileURL(pack) != nil else { return nil }
         let player = SamplerPlayer()
         player.bus = bus
+        player.setVolume(knobVolume)
         player.setEffects(bus.flatMap { effects($0) } ?? .none)
         players[id] = player
         load(instrument, into: player)
@@ -207,10 +215,19 @@ final class InstrumentLibrary: NSObject, ObservableObject, URLSessionDownloadDel
     func effectsChanged(bus: String) {
         let value = effects(bus) ?? .none
         for player in players.values where player.bus == bus { player.setEffects(value) }
+        Synth.shared.setEffects(bus: bus, value)
     }
 
     /// Bend, modulation and volume reach every sampler.
     func forEachPlayer(_ body: (SamplerPlayer) -> Void) { players.values.forEach(body) }
+
+    /// Samplers the player plays (not loop playback): bend and modulation stay off the loops.
+    func forEachLivePlayer(_ body: (SamplerPlayer) -> Void) {
+        players.values.filter { !($0.bus?.hasPrefix("loop:") ?? false) }.forEach(body)
+    }
+
+    /// Last volume knob value, given to samplers created later (a loop's first play).
+    var knobVolume = 1.0
 
     /// Select an instrument; downloads its pack first when missing.
     func select(_ instrument: Instrument) {
@@ -376,7 +393,7 @@ struct Effects: Codable, Equatable {
 /// so the existing instrument plumbing carries it.
 enum SoundRoute {
     static func make(_ instrument: String, bus: String?) -> String {
-        guard let bus, instrument != InstrumentLibrary.synthId else { return instrument }
+        guard let bus else { return instrument }
         return "\(instrument)@\(bus)"
     }
 
@@ -388,38 +405,101 @@ enum SoundRoute {
 
 // MARK: - Sampler
 
+/// The thread-safe heart of a `SamplerPlayer`: its unit, whether it may sound, and how many
+/// holders each pitch has. The main thread (chords, loops) and the MIDI thread (live keys, see
+/// `LiveFastPath`) both go through it; its lock serializes them and the MIDI they send.
+final class SamplerGate: @unchecked Sendable {
+    let unit: AVAudioUnitSampler
+    private struct State {
+        var ready = false
+        var counts: [Int: Int] = [:]
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(unit: AVAudioUnitSampler) { self.unit = unit }
+
+    var isReady: Bool { state.withLock { $0.ready } }
+
+    /// Turning it off first is what makes detaching the unit safe: no MIDI goes out after this.
+    func setReady(_ ready: Bool) {
+        state.withLock { s in
+            s.ready = ready
+            if !ready { s.counts.removeAll() }
+        }
+    }
+
+    /// False (silent) while the bank loads.
+    @discardableResult
+    func on(_ midi: Int, velocity: UInt8, at time: Double? = nil) -> Bool {
+        state.withLock { s in
+            guard s.ready else { return false }
+            s.counts[midi, default: 0] += 1
+            AudioClock.send(unit, 0x90, UInt8(midi), velocity, at: time)
+            return true
+        }
+    }
+
+    /// Stops the pitch when its last holder lets go.
+    func off(_ midi: Int, at time: Double? = nil) {
+        state.withLock { s in
+            guard s.ready, let held = s.counts[midi] else { return }
+            s.counts[midi] = held > 1 ? held - 1 : nil
+            if held <= 1 { AudioClock.send(unit, 0x80, UInt8(midi), 0, at: time) }
+        }
+    }
+
+    func allOff() {
+        state.withLock { s in
+            if s.ready { for midi in s.counts.keys { unit.stopNote(UInt8(midi), onChannel: 0) } }
+            s.counts.removeAll()
+        }
+    }
+}
+
 /// An `AVAudioUnitSampler` on the synth's engine. Note ids let two chords share a note:
 /// it only stops when the last one lets go.
 @MainActor
 final class SamplerPlayer {
     private let unit = AVAudioUnitSampler()
-    private let limiter = AVAudioUnitEffect(audioComponentDescription: AudioComponentDescription(
-        componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_PeakLimiter,
-        componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0))
+    /// Thread-safe note gate on `unit` (the MIDI thread plays live keys through it).
+    nonisolated let gate: SamplerGate
     private let eq = AVAudioUnitEQ(numberOfBands: 1)
     private let delay = AVAudioUnitDelay()
     private let reverb = AVAudioUnitReverb()
-    private var limiterAttached = false
+    private var chainAttached = false
+    /// Sampler gain at level 1: room for two samplers of fff chords plus drums under 0 dBFS,
+    /// so the master limiter only catches rare peaks.
+    nonisolated static let headroomDB: Float = -6
+    private var level = 1.0
     /// Effects bus this sampler plays through, if any.
     var bus: String?
     /// The unit renders only once its bank is in: loading into a sampler that is rendering
     /// crashes CoreAudio (playing while a program change switched the sound did).
     private var ready = false
     private var notes: [Int: Int] = [:]
-    private var counts: [Int: Int] = [:]
+    /// Host time each scheduled note starts at, so its note-off never lands before it.
+    private var starts: [Int: Double] = [:]
     private var nextId = 1
     private var generation = 0
+
+    init() { gate = SamplerGate(unit: unit) }
+
+    /// Every sound bank load goes through this one queue: AUSampler crashes (CAVerboseAbort in
+    /// AudioUnitSetProperty) when several samplers load banks at the same time, as happened
+    /// when all keyboards prepared their sounds at launch.
+    nonisolated static let loadQueue = DispatchQueue(label: "chordy.sampler-load", qos: .userInitiated)
 
     func load(url: URL, program: UInt8, bankMSB: UInt8, done: @escaping (Bool) -> Void) {
         allOff()
         if ready {
+            gate.setReady(false)
             Synth.shared.detach(unit)
             ready = false
         }
         generation += 1
         let current = generation
         let unit = self.unit
-        DispatchQueue.global(qos: .userInitiated).async {
+        SamplerPlayer.loadQueue.async {
             var ok = true
             do {
                 try unit.loadSoundBankInstrument(at: url, program: program, bankMSB: bankMSB, bankLSB: 0)
@@ -430,24 +510,30 @@ final class SamplerPlayer {
             DispatchQueue.main.async {
                 guard current == self.generation else { return }
                 if ok {
-                    // Sampler → filter → delay → reverb → peak limiter → mixer (the limiter keeps
-                    // chords of loud samples from clipping).
-                    if !self.limiterAttached {
-                        Synth.shared.attach(self.limiter)
-                        Synth.shared.attach(self.reverb, to: self.limiter)
+                    // Sampler → filter → delay → reverb → mixer. Headroom comes from the sampler's
+                    // gain; only the master limiter guards 0 dBFS.
+                    if !self.chainAttached {
+                        Synth.shared.attach(self.reverb)
                         Synth.shared.attach(self.delay, to: self.reverb)
                         Synth.shared.attach(self.eq, to: self.delay)
-                        self.limiterAttached = true
+                        self.chainAttached = true
                     }
                     Synth.shared.attach(unit, to: self.eq)
+                    self.applyGain()
                     self.ready = true
+                    self.gate.setReady(true)
                 }
                 done(ok)
             }
         }
     }
 
-    func setEffects(_ e: Effects) {
+    func setEffects(_ e: Effects) { Effects.apply(e, eq: eq, delay: delay, reverb: reverb) }
+}
+
+extension Effects {
+    /// Filter → echo → reverb settings, shared by the samplers and the synth's outputs.
+    static func apply(_ e: Effects, eq: AVAudioUnitEQ, delay: AVAudioUnitDelay, reverb: AVAudioUnitReverb) {
         let band = eq.bands[0]
         band.filterType = .lowPass
         band.frequency = Float(200 * pow(100, min(1, max(0, e.filter))))
@@ -463,37 +549,47 @@ final class SamplerPlayer {
         reverb.wetDryMix = Float(e.reverb * 60)
         reverb.bypass = e.reverb <= 0.001
     }
+}
 
-    /// Notes played while the bank loads are silent but keep their ids.
-    func noteOn(midi: Int, velocity: Int) -> Int {
+extension SamplerPlayer {
+
+    /// Notes played while the bank loads are silent but keep their ids. `time`: host time it
+    /// must sound at, sample-accurately (loop playback schedules ahead); nil = now.
+    func noteOn(midi: Int, velocity: Int, at time: Double? = nil) -> Int {
         let id = nextId
         nextId += 1
-        guard ready else { return id }
+        guard ready, gate.on(midi, velocity: Self.curve(velocity), at: time) else { return id }
         notes[id] = midi
-        counts[midi, default: 0] += 1
-        unit.startNote(UInt8(midi), withVelocity: Self.curve(velocity), onChannel: 0)
+        if let time { starts[id] = time }
         return id
     }
 
     /// AUSampler applies the SF2 velocity curve, which is very steep: velocity 30 sounds ~40 dB
     /// under 127, almost silent. Squeeze 1…127 into 45…127 so soft playing stays audible
     /// (≈ 25–30 dB of dynamics, like a real piano) and the keyboard feels even.
-    static func curve(_ velocity: Int) -> UInt8 {
+    static func curve(_ velocity: Int) -> UInt8 { curveValue(velocity) }
+
+    nonisolated static func curveValue(_ velocity: Int) -> UInt8 {
         let v = Double(max(1, min(127, velocity))) / 127
         return UInt8((45 + 82 * pow(v, 0.75)).rounded())
     }
 
-    func noteOff(_ id: Int) {
+    func noteOff(_ id: Int, at time: Double? = nil) {
         guard let midi = notes.removeValue(forKey: id) else { return }
-        let left = (counts[midi] ?? 1) - 1
-        counts[midi] = left > 0 ? left : nil
-        if left <= 0 { unit.stopNote(UInt8(midi), onChannel: 0) }
+        let start = starts.removeValue(forKey: id)
+        // A note scheduled ahead may not have started yet: stop it just after it does.
+        let when = max(time ?? 0, start.map { $0 + 0.002 } ?? 0)
+        gate.off(midi, at: when > CACurrentMediaTime() ? when : nil)
     }
 
     func allOff() {
-        if ready { for midi in counts.keys { unit.stopNote(UInt8(midi), onChannel: 0) } }
+        // Notes scheduled to start a few ms from now get their own note-off after they start.
+        for (id, start) in starts where ready && start > CACurrentMediaTime() {
+            if let midi = notes[id] { gate.off(midi, at: start + 0.002) }
+        }
+        gate.allOff()
         notes.removeAll()
-        counts.removeAll()
+        starts.removeAll()
     }
 
     /// Semitones, ±2 range (the sampler's default bend range).
@@ -506,6 +602,19 @@ final class SamplerPlayer {
     func setModulation(_ value: Double) { guard ready else { return }; unit.sendController(1, withValue: UInt8(value * 127), onChannel: 0) }
 
     func setVolume(_ value: Double) { unit.volume = Float(value) }
+
+    /// Keyboard or loops volume as gain (1 = the 0.85 default), not velocity.
+    func setLevel(_ value: Double) {
+        let clamped = max(0, min(2, value))
+        guard clamped != level else { return }
+        level = clamped
+        applyGain()
+    }
+
+    private func applyGain() {
+        let db = level > 0.0001 ? Float(20 * log10(level)) : -90
+        unit.overallGain = max(-90, min(12, Self.headroomDB + db))
+    }
 }
 
 // MARK: - Output router
@@ -516,42 +625,47 @@ final class SamplerPlayer {
 @MainActor
 final class SoundOutput {
     private let instruments: InstrumentLibrary
-    private let patch: () -> Patch
+    private let patch: (String?) -> Patch
     private var sustain = false
     private var deferred: [(Int, Double?)] = []
     /// Sampler notes: our id (negative) → its player and that player's note id.
     private var samplerNotes: [Int: (player: SamplerPlayer, note: Int)] = [:]
     private var nextId = -1
 
-    init(instruments: InstrumentLibrary, patch: @escaping () -> Patch) {
+    /// `patch`: the synth sound for "synth" (nil, the one being edited) or "synth:<id>".
+    init(instruments: InstrumentLibrary, patch: @escaping (String?) -> Patch) {
         self.instruments = instruments
         self.patch = patch
     }
 
     /// `instrument` is a loop's own (`synthId` or an `Instrument.id`); nil = the selected one.
-    func noteOn(midi: Int, velocity: Int, instrument: String? = nil) -> Int {
+    /// `time`: host time to sound at (scheduled loop notes); nil = now.
+    func noteOn(midi: Int, velocity: Int, instrument: String? = nil, at time: Double? = nil) -> Int {
         let id = instrument ?? instruments.selectedId
-        if id != InstrumentLibrary.synthId, let player = instruments.player(for: id) {
+        let plain = SoundRoute.parse(id).instrument
+        if !InstrumentLibrary.isSynth(plain), let player = instruments.player(for: id) {
             let ours = nextId
             nextId -= 1
-            samplerNotes[ours] = (player, player.noteOn(midi: midi, velocity: velocity))
+            samplerNotes[ours] = (player, player.noteOn(midi: midi, velocity: velocity, at: time))
             return ours
         }
-        var sound = patch()
+        var sound = patch(InstrumentLibrary.synthPatchId(plain))
         sound.volume *= 0.35 + 0.65 * Double(velocity) / 127
-        return Synth.shared.noteOn(midi: midi, patch: sound)
+        let bus = SoundRoute.parse(id).bus
+        let slot = Synth.shared.slot(for: bus, effects: bus.flatMap { instruments.effects($0) } ?? .none)
+        return Synth.shared.noteOn(midi: midi, patch: sound, slot: slot, at: time)
     }
 
     /// `pedal: false` for loop notes: the sustain pedal only holds what the player plays.
-    func noteOff(_ id: Int, release: Double? = nil, pedal: Bool = true) {
+    func noteOff(_ id: Int, release: Double? = nil, pedal: Bool = true, at time: Double? = nil) {
         if sustain && pedal {
             deferred.append((id, release))
             return
         }
         if id < 0 {
-            if let entry = samplerNotes.removeValue(forKey: id) { entry.player.noteOff(entry.note) }
+            if let entry = samplerNotes.removeValue(forKey: id) { entry.player.noteOff(entry.note, at: time) }
         } else {
-            Synth.shared.noteOff(id, release: release)
+            Synth.shared.noteOff(id, release: release, at: time)
         }
     }
 

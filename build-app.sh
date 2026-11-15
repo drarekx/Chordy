@@ -44,6 +44,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$BUILD</string>
+    <key>NSLocalNetworkUsageDescription</key><string>Chordy Pads (iPad) se conecta a Chordy por la red local para tocar la batería.</string>
+    <key>NSBonjourServices</key><array><string>_chordypads._tcp</string></array>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key><true/>

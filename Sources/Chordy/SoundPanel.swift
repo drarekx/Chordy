@@ -20,68 +20,99 @@ struct SoundPanel: View {
 
     @ViewBuilder
     private var synthEditor: some View {
-                SectionLabel(tr("Sintetizador"))
-                PresetBar(sounds: sounds)
-                WaveformPreview(patch: sounds.draft).frame(height: 56)
+        SectionLabel(tr("Sintetizador"))
+        PresetBar(sounds: sounds)
+        SynthSourceEditor(sounds: sounds)
+        SynthShapeEditor(sounds: sounds)
+        Button { UserDefaults.standard.set("synth", forKey: "mainMode") } label: {
+            Label(tr("Abrir el sintetizador grande"), systemImage: "arrow.up.left.and.arrow.down.right").fixedSize()
+        }
+        .buttonStyle(.appSecondary)
+    }
+}
 
-                section(tr("Osciladores")) {
-                    ForEach(0..<Patch.oscillatorCount, id: \.self) { i in
-                        OscillatorRow(index: i, oscillator: $sounds.draft.oscillators[i])
-                    }
-                }
+/// Oscillators, the wave preview and the harmonics drawing of the sound being edited.
+struct SynthSourceEditor: View {
+    @ObservedObject var sounds: SoundLibrary
 
-                if usesCustomWave {
-                    section(tr("Armónicos"), hint: tr("arrastra para dibujar la onda")) {
-                        HarmonicsEditor(harmonics: $sounds.draft.harmonics)
-                    }
-                }
+    private var usesCustomWave: Bool { sounds.draft.oscillators.contains { $0.enabled && $0.wave == .custom } }
 
-                section(tr("Filtro"), trailing: {
-                    SegmentedControl(options: [("LP", Patch.FilterType.lowpass), ("HP", .highpass), ("BP", .bandpass)],
-                                     selection: $sounds.draft.filter.type)
-                }) {
-                    ParamSlider(label: tr("Corte"), value: $sounds.draft.filter.cutoff, range: Patch.Range.cutoff,
-                                log: true, format: Format.hz)
-                    ParamSlider(label: tr("Resonancia"), value: $sounds.draft.filter.resonance,
-                                range: Patch.Range.resonance, format: { String(format: "%.1f", $0) })
-                    ParamSlider(label: tr("Envolvente"), value: $sounds.draft.filter.envAmount,
-                                range: Patch.Range.envAmount, format: Format.octaves)
-                    ParamSlider(label: tr("Tiempo env."), value: $sounds.draft.filter.envDecay,
-                                range: Patch.Range.envDecay, log: true, format: Format.seconds)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            WaveformPreview(patch: sounds.draft).frame(height: 56)
+            EditorSection(tr("Osciladores")) {
+                ForEach(0..<Patch.oscillatorCount, id: \.self) { i in
+                    OscillatorRow(index: i, oscillator: $sounds.draft.oscillators[i])
                 }
+            }
+            if usesCustomWave {
+                EditorSection(tr("Armónicos"), hint: tr("arrastra para dibujar la onda")) {
+                    HarmonicsEditor(harmonics: $sounds.draft.harmonics)
+                }
+            }
+        }
+    }
+}
 
-                section(tr("Envolvente")) {
-                    EnvelopeGraph(envelope: sounds.draft.envelope).frame(height: 54)
-                    ParamSlider(label: tr("Ataque"), value: $sounds.draft.envelope.attack, range: Patch.Range.attack,
-                                log: true, format: Format.seconds)
-                    ParamSlider(label: tr("Caída"), value: $sounds.draft.envelope.decay, range: Patch.Range.decay,
-                                log: true, format: Format.seconds)
-                    ParamSlider(label: tr("Sostenido"), value: $sounds.draft.envelope.sustain, range: 0...1,
-                                format: Format.percent)
-                    ParamSlider(label: tr("Liberación"), value: $sounds.draft.envelope.release, range: Patch.Range.release,
-                                log: true, format: Format.seconds)
-                }
+/// Filter, envelope, vibrato and volume of the sound being edited.
+struct SynthShapeEditor: View {
+    @ObservedObject var sounds: SoundLibrary
 
-                section(tr("Vibrato")) {
-                    ParamSlider(label: tr("Velocidad"), value: $sounds.draft.vibrato.rate, range: Patch.Range.vibratoRate,
-                                format: { String(format: "%.1f Hz", $0) })
-                    ParamSlider(label: tr("Profundidad"), value: $sounds.draft.vibrato.depth,
-                                range: Patch.Range.vibratoDepth, format: { "\(Int($0.rounded())) ct" })
-                }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            EditorSection(tr("Filtro"), trailing: {
+                SegmentedControl(options: [("LP", Patch.FilterType.lowpass), ("HP", .highpass), ("BP", .bandpass)],
+                                 selection: $sounds.draft.filter.type)
+            }) {
+                ParamSlider(label: tr("Corte"), value: $sounds.draft.filter.cutoff, range: Patch.Range.cutoff,
+                            log: true, format: Format.hz)
+                ParamSlider(label: tr("Resonancia"), value: $sounds.draft.filter.resonance,
+                            range: Patch.Range.resonance, format: { String(format: "%.1f", $0) })
+                ParamSlider(label: tr("Envolvente"), value: $sounds.draft.filter.envAmount,
+                            range: Patch.Range.envAmount, format: Format.octaves)
+                ParamSlider(label: tr("Tiempo env."), value: $sounds.draft.filter.envDecay,
+                            range: Patch.Range.envDecay, log: true, format: Format.seconds)
+            }
+            EditorSection(tr("Envolvente")) {
+                EnvelopeGraph(envelope: sounds.draft.envelope).frame(height: 54)
+                ParamSlider(label: tr("Ataque"), value: $sounds.draft.envelope.attack, range: Patch.Range.attack,
+                            log: true, format: Format.seconds)
+                ParamSlider(label: tr("Caída"), value: $sounds.draft.envelope.decay, range: Patch.Range.decay,
+                            log: true, format: Format.seconds)
+                ParamSlider(label: tr("Sostenido"), value: $sounds.draft.envelope.sustain, range: 0...1,
+                            format: Format.percent)
+                ParamSlider(label: tr("Liberación"), value: $sounds.draft.envelope.release, range: Patch.Range.release,
+                            log: true, format: Format.seconds)
+            }
+            EditorSection(tr("Vibrato")) {
+                ParamSlider(label: tr("Velocidad"), value: $sounds.draft.vibrato.rate, range: Patch.Range.vibratoRate,
+                            format: { String(format: "%.1f Hz", $0) })
+                ParamSlider(label: tr("Profundidad"), value: $sounds.draft.vibrato.depth,
+                            range: Patch.Range.vibratoDepth, format: { "\(Int($0.rounded())) ct" })
+            }
+            EditorSection(tr("Salida")) {
+                ParamSlider(label: tr("Volumen"), value: $sounds.draft.volume, range: 0...1, format: Format.percent)
+            }
+        }
+    }
+}
 
-                section(tr("Salida")) {
-                    ParamSlider(label: tr("Volumen"), value: $sounds.draft.volume, range: 0...1, format: Format.percent)
-                }
+/// A titled block of the synth editor.
+struct EditorSection<Trailing: View, Content: View>: View {
+    let title: String
+    var hint: String?
+    @ViewBuilder var trailing: () -> Trailing
+    @ViewBuilder var content: () -> Content
+
+    init(_ title: String, hint: String? = nil, @ViewBuilder trailing: @escaping () -> Trailing,
+         @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.hint = hint
+        self.trailing = trailing
+        self.content = content
     }
 
-    private func section<Content: View>(_ title: String, hint: String? = nil,
-                                        @ViewBuilder content: () -> Content) -> some View {
-        section(title, hint: hint, trailing: { EmptyView() }, content: content)
-    }
-
-    private func section<Trailing: View, Content: View>(_ title: String, hint: String? = nil,
-                                                         @ViewBuilder trailing: () -> Trailing,
-                                                         @ViewBuilder content: () -> Content) -> some View {
+    var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 SectionLabel(title)
@@ -94,6 +125,12 @@ struct SoundPanel: View {
     }
 }
 
+extension EditorSection where Trailing == EmptyView {
+    init(_ title: String, hint: String? = nil, @ViewBuilder content: @escaping () -> Content) {
+        self.init(title, hint: hint, trailing: { EmptyView() }, content: content)
+    }
+}
+
 enum Format {
     static func hz(_ v: Double) -> String { v >= 1000 ? String(format: "%.1fk", v / 1000) : "\(Int(v.rounded()))" }
     static func seconds(_ v: Double) -> String { v < 1 ? "\(Int((v * 1000).rounded()))ms" : String(format: "%.2fs", v) }
@@ -103,7 +140,7 @@ enum Format {
 
 // MARK: - Presets
 
-private struct PresetBar: View {
+struct PresetBar: View {
     @ObservedObject var sounds: SoundLibrary
     @State private var naming = false
     @State private var name = ""
@@ -209,7 +246,7 @@ struct ParamSlider: View {
     }
 }
 
-private struct OscillatorRow: View {
+struct OscillatorRow: View {
     let index: Int
     @Binding var oscillator: Patch.Oscillator
 
@@ -249,7 +286,7 @@ private struct OscillatorRow: View {
 }
 
 /// 16 harmonic amplitudes; drag across the bars to paint them.
-private struct HarmonicsEditor: View {
+struct HarmonicsEditor: View {
     @Binding var harmonics: [Double]
 
     private static let shapes: [(String, [Double])] = [
@@ -297,7 +334,7 @@ private struct HarmonicsEditor: View {
 }
 
 /// One cycle of the mixed oscillators (detune ignored).
-private struct WaveformPreview: View {
+struct WaveformPreview: View {
     let patch: Patch
 
     var body: some View {
@@ -341,7 +378,7 @@ private struct WaveformPreview: View {
 }
 
 /// ADSR shape: attack, decay and release on a log-ish time axis, sustain as a plateau.
-private struct EnvelopeGraph: View {
+struct EnvelopeGraph: View {
     let envelope: Patch.Envelope
 
     var body: some View {

@@ -146,6 +146,12 @@ final class Keyboards: ObservableObject {
 
     func remove(_ id: String) { configs.removeAll { $0.id == id } }
 
+    /// Opening a project: its keyboards replace these (effects buses follow).
+    func replaceAll(_ new: [KeyboardConfig]) {
+        configs = new
+        for c in new { instruments.effectsChanged(bus: "kb:\(c.id)") }
+    }
+
     /// A second zone on the same device (split keyboard): upper half of the first.
     func addZone(from id: String) {
         guard let source = config(id) else { return }
@@ -210,7 +216,9 @@ final class Keyboards: ObservableObject {
     func markActive(_ id: String) { if active != id { active = id } }
 
     static func soundName(_ id: String) -> String {
-        id == InstrumentLibrary.synthId ? tr("Sintetizador") : Instrument.with(id)?.name ?? id
+        if id == InstrumentLibrary.synthId { return tr("Sintetizador") }
+        if let patch = InstrumentLibrary.synthPatchId(id) { return AppModel.shared.sounds.name(of: patch) }
+        return Instrument.with(id)?.name ?? id
     }
 
     // MARK: Zone learning

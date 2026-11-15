@@ -43,13 +43,11 @@ final class MidiController: ObservableObject {
         }
     }
     @Published private(set) var lastEvent: Monitor?
-    /// Live state of each device for the drawings: raw keys held, control values (0…1) and
-    /// pressed buttons/pads, keyed "<device>|<control id>".
-    @Published private(set) var liveNotes: [String: Set<Int>] = [:]
-    @Published private(set) var liveValues: [String: Double] = [:]
-    @Published private(set) var livePressed: Set<String> = []
-    /// Lowest note of the 25-key window per device (follows the hardware octave buttons).
-    @Published private(set) var keyWindow: [String: Int] = [:]
+    /// Live state of each device for the drawings, in its own object so a key press only
+    /// redraws the drawings (not every view that watches the controller).
+    let live = LiveMIDI()
+    /// Connected inputs, observable on their own (cards and header only care about this).
+    let devices = DeviceList()
     /// Light the Launchkey pads (switches it to InControl mode).
     @Published var lightsEnabled = UserDefaults.standard.bool(forKey: "launchkeyLights") {
         didSet {
@@ -65,6 +63,9 @@ final class MidiController: ObservableObject {
     var hasLaunchkey: Bool { inputs.contains { $0.localizedCaseInsensitiveContains("launchkey") } }
 
     private let io = MidiIO()
+    /// Sounds Notes-layout keys on the MIDI thread (see `LiveFastPath`).
+    let fastPath = LiveFastPath()
+    private var fastPathScheduled = false
     private let engine: ChordEngine
     private let sounds: SoundLibrary
     private let instruments: InstrumentLibrary
@@ -133,10 +134,48 @@ final class MidiController: ObservableObject {
 
     func start() {
         io.onMessage = { [weak self] in self?.receive($0) }
+        let fast = fastPath
+        io.fastPath = { status, d1, d2, device in fast.handle(status: status, data1: d1, data2: d2, device: device) }
+        let settings: [AnyPublisher<Void, Never>] = [
+            $learning.map { _ in () }.eraseToAnyPublisher(), $awaitingKey.map { _ in () }.eraseToAnyPublisher(),
+            $bindings.map { _ in () }.eraseToAnyPublisher(), keyboards.objectWillChange.eraseToAnyPublisher(),
+            instruments.objectWillChange.eraseToAnyPublisher(),
+        ]
+        for publisher in settings {
+            publisher.sink { [weak self] _ in self?.scheduleFastPath() }.store(in: &cancellables)
+        }
+        refreshFastPath()
         io.onDevicesChanged = { [weak self] in self?.devicesChanged() }
         io.start()
         engine.onNotes = { [weak self] notes, on in self?.forward(notes, on: on) }
         engine.objectWillChange.sink { [weak self] _ in self?.scheduleLights() }.store(in: &cancellables)
+    }
+
+    private func scheduleFastPath() {
+        guard !fastPathScheduled else { return }
+        fastPathScheduled = true
+        // objectWillChange fires before the change: read the settings on the next turn.
+        DispatchQueue.main.async { [weak self] in
+            self?.fastPathScheduled = false
+            self?.refreshFastPath()
+        }
+    }
+
+    /// What the MIDI thread may play on its own: Notes-layout keyboards with a sampled sound,
+    /// and never while something is being learned.
+    private func refreshFastPath() {
+        var snap = LiveFastPath.Snapshot()
+        snap.enabled = learning == nil && !awaitingKey && keyboards.learningZone == nil
+        snap.keyboards = keyboards.configs
+        for config in keyboards.configs where config.layout == .notes && !InstrumentLibrary.isSynth(config.instrument) {
+            guard let player = instruments.player(for: config.route) else { continue }
+            player.setLevel(config.volume / 0.85)
+            snap.gates[config.id] = player.gate
+        }
+        snap.pedalDevices = Set(keyboards.configs.map(\.device).filter { _ in
+            !(1...16).contains { bindings[MidiControl(.cc, channel: $0, number: 64).id] != nil }
+        })
+        fastPath.update(snap)
     }
 
     /// Leave the Launchkey in its normal mode on quit.
@@ -146,6 +185,7 @@ final class MidiController: ObservableObject {
 
     private func devicesChanged() {
         inputs = io.inputNames
+        if devices.names != inputs { devices.names = inputs }
         keyboards.adopt(sources: inputs, legacy: (legacyLayout, instruments.selectedId))
         releaseHolds()
         applyInControl()
@@ -248,7 +288,7 @@ final class MidiController: ObservableObject {
     #if DEBUG
     /// Debug hook: feed a raw message as if a device sent it.
     func inject(_ status: UInt8, _ data1: UInt8, _ data2: UInt8, device: String = "debug") {
-        receive(MidiIO.Message(status: status, data1: data1, data2: data2, device: device))
+        receive(MidiIO.Message(status: status, data1: data1, data2: data2, device: device, time: now()))
     }
     #endif
 
@@ -281,7 +321,7 @@ final class MidiController: ObservableObject {
         // A keyboard's keys play its own sound; a key mapped explicitly still wins.
         if isNote, bindings[id] == nil || keyboards.hasKeyboard(on: device),
            let keyboard = keyboards.match(device: device, channel: event.control.channel, note: event.control.number) {
-            playKeyboard(keyboard, event, device: device)
+            playKeyboard(keyboard, event, device: device, message: message)
             return
         }
         // Sustain pedal of a keyboard, unless mapped to something else.
@@ -312,25 +352,22 @@ final class MidiController: ObservableObject {
         let key = "\(device)|\(event.control.id)"
         switch event.control.kind {
         case .note:
-            var held = liveNotes[device] ?? []
+            var held = live.notes[device] ?? []
             if event.pressed { held.insert(event.control.number) } else { held.remove(event.control.number) }
-            liveNotes[device] = held
-            if event.pressed { livePressed.insert(key) } else { livePressed.remove(key) }
+            live.notes[device] = held
+            if event.pressed { live.pressed.insert(key) } else { live.pressed.remove(key) }
             if event.pressed, event.control.channel != 10 {
-                let base = keyWindow[device] ?? 48
+                let base = live.keyWindow[device] ?? 48
                 let n = event.control.number
-                if n < base || n > base + 24 { keyWindow[device] = n - ((n - base) % 12 + 12) % 12 - (n < base ? 0 : 12) }
+                if n < base || n > base + 24 { live.keyWindow[device] = n - ((n - base) % 12 + 12) % 12 - (n < base ? 0 : 12) }
             }
         case .cc, .pb:
-            liveValues[key] = event.value
+            live.values[key] = event.value
             if event.control.kind == .cc {
-                if event.pressed { livePressed.insert(key) } else { livePressed.remove(key) }
+                if event.pressed { live.pressed.insert(key) } else { live.pressed.remove(key) }
             }
         }
     }
-
-    func value(_ device: String, _ control: MidiControl) -> Double? { liveValues["\(device)|\(control.id)"] }
-    func isPressed(_ device: String, _ control: MidiControl) -> Bool { livePressed.contains("\(device)|\(control.id)") }
 
     /// What a control does, for the drawings.
     func mapping(_ control: MidiControl) -> String? { bindings[control.id]?.label }
@@ -392,29 +429,38 @@ final class MidiController: ObservableObject {
 
     /// Plays a key on its keyboard: notes, chromatic chords or degrees, with its sound,
     /// octave, velocity curve and volume.
-    private func playKeyboard(_ keyboard: KeyboardConfig, _ event: MidiEvent, device: String) {
+    private func playKeyboard(_ keyboard: KeyboardConfig, _ event: MidiEvent, device: String,
+                              message: MidiIO.Message? = nil) {
         let key = "\(keyboard.id):\(event.control.number)"
+        let arrival = message.flatMap { $0.time > 0 ? $0.time : nil }
         let note = event.control.number + keyboard.octave * 12
         let raw = max(1, Int((event.value * 127).rounded()))
-        let scaled = Double(keyboard.curve.apply(raw)) * keyboard.volume / 0.85
-        let velocity = max(1, min(127, Int(scaled.rounded())))
+        // Sampled sounds take the keyboard's volume as gain, so the velocity (what gets recorded
+        // into loops) is just the curved key velocity; the synth still scales velocity.
+        let curved = keyboard.curve.apply(raw)
+        let sampled = !InstrumentLibrary.isSynth(SoundRoute.parse(keyboard.route).instrument)
+        if sampled, event.pressed { instruments.player(for: keyboard.route)?.setLevel(keyboard.volume / 0.85) }
+        let velocity = sampled ? curved
+                               : max(1, min(127, Int((Double(curved) * keyboard.volume / 0.85).rounded())))
         lastEvent = Monitor(label: event.control.label, device: device, value: raw, action: keyboard.name)
         if event.pressed { keyboards.markActive(keyboard.id) }
         switch keyboard.layout {
         case .notes:
+            let presounded = message?.presounded ?? false
             if event.pressed {
-                engine.playNote(key: key, midi: note, velocity: velocity, instrument: keyboard.route, owner: keyboard.id)
+                engine.playNote(key: key, midi: note, velocity: velocity, instrument: keyboard.route, owner: keyboard.id,
+                                presounded: presounded, time: message.flatMap { $0.time > 0 ? $0.time : nil })
             } else {
-                engine.stopNote(key: key)
+                engine.stopNote(key: key, time: message.flatMap { $0.time > 0 ? $0.time : nil })
             }
         case .chromatic:
             if event.pressed, keyHolds[key] == nil {
                 var chord = chromaticChord(note: note)
                 chord.owner = keyboard.id
                 keyHolds[key] = chord
-                engine.press(chord, chromatic: true, velocity: velocity, instrument: keyboard.route)
+                engine.press(chord, chromatic: true, velocity: velocity, instrument: keyboard.route, time: arrival)
             } else if !event.pressed, let held = keyHolds.removeValue(forKey: key) {
-                engine.release(held)
+                engine.release(held, time: arrival)
             }
         case .degrees:
             guard let action = MidiPresets.keyActions[((note % 12) + 12) % 12] else { return }
@@ -422,9 +468,9 @@ final class MidiController: ObservableObject {
             if event.pressed, keyHolds[key] == nil {
                 let chord = HeldChord(degree: degree, octave: MidiPresets.octave(ofNote: note), owner: keyboard.id)
                 keyHolds[key] = chord
-                engine.press(chord, velocity: velocity, instrument: keyboard.route)
+                engine.press(chord, velocity: velocity, instrument: keyboard.route, time: arrival)
             } else if !event.pressed, let held = keyHolds.removeValue(forKey: key) {
-                engine.release(held)
+                engine.release(held, time: arrival)
             }
         }
     }
@@ -538,7 +584,7 @@ final class MidiController: ObservableObject {
         case .pitchBend:
             let semitones = (v - 0.5) * 4
             Synth.shared.setBend(abs(semitones) < 0.02 ? 0 : semitones)
-            instruments.forEachPlayer { $0.setBend(abs(semitones) < 0.02 ? 0 : semitones) }
+            instruments.forEachLivePlayer { $0.setBend(abs(semitones) < 0.02 ? 0 : semitones) }
             if sendToVirtual {
                 let raw = Int((v * 16383).rounded())
                 io.sendVirtual(0xE0, UInt8(raw & 0x7F), UInt8(raw >> 7))
@@ -550,8 +596,8 @@ final class MidiController: ObservableObject {
 
     /// Knobs edit the current sound (filter, levels and vibrato apply to held notes too).
     private func editSound(_ action: MidiAction, _ v: Double) {
-        if action == .volume { instruments.forEachPlayer { $0.setVolume(v) } }
-        if action == .vibratoDepth { instruments.forEachPlayer { $0.setModulation(v) } }
+        if action == .volume { instruments.knobVolume = v; instruments.forEachPlayer { $0.setVolume(v) } }
+        if action == .vibratoDepth { instruments.forEachLivePlayer { $0.setModulation(v) } }
         var p = sounds.draft
         typealias R = Patch.Range
         func lerp(_ r: ClosedRange<Double>, _ t: Double) -> Double { r.lowerBound + (r.upperBound - r.lowerBound) * t }
@@ -714,6 +760,7 @@ final class MidiController: ObservableObject {
     }
 
     private func releaseKeys() {
+        fastPath.allOff()
         for chord in keyHolds.values { engine.release(chord) }
         keyHolds.removeAll()
         for key in engine.heldNotes.keys { engine.stopNote(key: key) }
@@ -727,4 +774,24 @@ final class MidiController: ObservableObject {
         lights.removeAll()
         scheduleLights()
     }
+}
+
+/// Raw keys held, control values (0…1) and pressed buttons/pads per device, keyed
+/// "<device>|<control id>", for the device drawings.
+@MainActor
+final class LiveMIDI: ObservableObject {
+    @Published var notes: [String: Set<Int>] = [:]
+    @Published var values: [String: Double] = [:]
+    @Published var pressed: Set<String> = []
+    /// Lowest note of the 25-key window per device (follows the hardware octave buttons).
+    @Published var keyWindow: [String: Int] = [:]
+
+    func value(_ device: String, _ control: MidiControl) -> Double? { values["\(device)|\(control.id)"] }
+    func isPressed(_ device: String, _ control: MidiControl) -> Bool { pressed.contains("\(device)|\(control.id)") }
+}
+
+/// MIDI inputs connected now.
+@MainActor
+final class DeviceList: ObservableObject {
+    @Published var names: [String] = []
 }

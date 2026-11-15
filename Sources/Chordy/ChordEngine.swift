@@ -65,6 +65,8 @@ struct PlayedChord {
     let start: Double
     let end: Double
     var instrument: String?
+    /// Velocity it was played with (loops replay it as played).
+    var velocity = 100
 }
 
 /// A held player chord: degree plus octave (a MIDI keyboard can hold the same degree in two octaves),
@@ -98,9 +100,22 @@ final class ChordEngine: ObservableObject {
             revoice { _ in true }
         }
     }
-    @Published private(set) var color: ChordColor = .diatonic
+    @Published private(set) var color: ChordColor = ChordColor(rawValue: UserDefaults.standard.string(forKey: "chordType") ?? "") ?? .diatonic
+    /// Chord type chosen in the header: what chords play when no W A S D / pad color is held.
+    @Published var chordType: ChordColor = ChordColor(rawValue: UserDefaults.standard.string(forKey: "chordType") ?? "") ?? .diatonic {
+        didSet {
+            guard chordType != oldValue else { return }
+            UserDefaults.standard.set(chordType.rawValue, forKey: "chordType")
+            applyDirectionKeys()
+        }
+    }
     @Published private(set) var direction: Direction?
-    @Published private(set) var bpm = 110 { didSet { UserDefaults.standard.set(bpm, forKey: "bpm") } }
+    @Published private(set) var bpm = 110 {
+        didSet {
+            UserDefaults.standard.set(bpm, forKey: "bpm")
+            Transport.shared.setBpm(Double(bpm))
+        }
+    }
     @Published private(set) var octaveDown = false
     @Published private(set) var held = Set<HeldChord>()
     @Published private(set) var sounding: [SoundingChord] = []
@@ -146,6 +161,7 @@ final class ChordEngine: ObservableObject {
         if let saved = defaults.object(forKey: "bpm") as? Int {
             bpm = min(Self.bpmRange.upperBound, max(Self.bpmRange.lowerBound, saved))
         }
+        Transport.shared.setBpm(Double(bpm))
         pruneTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.prune() }
         }
@@ -191,7 +207,7 @@ final class ChordEngine: ObservableObject {
 
     private func startChord(id: String, degree: Degree, color requested: ChordColor, source: ChordSource,
                             octave: Int = 0, accidental: Int = 0, chromatic: Bool = false, velocity: Int = 100,
-                            instrument: String? = nil, owner: String? = nil) {
+                            instrument: String? = nil, owner: String? = nil, at time: Double? = nil) {
         guard !sounding.contains(where: { $0.id == id }) else { return }
         Synth.shared.start()
         let color = chromatic && requested == .diatonic ? .major : requested
@@ -199,27 +215,28 @@ final class ChordEngine: ObservableObject {
         let shift = octave * 12 + (down ? -12 : 0)
         let notes = Music.midiNotes(tonic, degree, flavor, color, accidental: accidental)
             .map { $0 + shift }.filter { (0...127).contains($0) }
-        let voices = notes.map { output.noteOn(midi: $0, velocity: velocity, instrument: instrument) }
-        sounding.append(SoundingChord(id: id, degree: degree, color: color, source: source, start: now(),
+        let voices = notes.map { output.noteOn(midi: $0, velocity: velocity, instrument: instrument, at: time) }
+        sounding.append(SoundingChord(id: id, degree: degree, color: color, source: source, start: time ?? now(),
                                       octave: octave, accidental: accidental, chromatic: chromatic,
                                       octaveDown: down, velocity: velocity, instrument: instrument,
                                       owner: owner, notes: notes, voices: voices))
         onNotes?(notes, true)
     }
 
-    private func endChord(id: String, release: Double? = nil) {
+    private func endChord(id: String, release: Double? = nil, at time: Double? = nil) {
         guard let index = sounding.firstIndex(where: { $0.id == id }) else { return }
         let chord = sounding.remove(at: index)
-        chord.voices.forEach { output.noteOff($0, release: release, pedal: chord.source == .user) }
+        chord.voices.forEach { output.noteOff($0, release: release, pedal: chord.source == .user, at: time) }
         onNotes?(chord.notes, false)
-        let end = now()
+        let end = max(chord.start, time ?? now())
         history.append(ChordEvent(row: chord.degree, accidental: chord.accidental, symbol: symbol(of: chord),
                                   color: chord.color, source: chord.source, start: chord.start, end: end,
                                   notes: chord.notes, owner: chord.owner))
         if chord.source == .user {
             let played = PlayedChord(degree: chord.degree, color: chord.color,
                                      octave: chord.octave - (chord.octaveDown ? 1 : 0), accidental: chord.accidental,
-                                     start: chord.start, end: end, instrument: chord.instrument)
+                                     start: chord.start, end: end, instrument: chord.instrument,
+                                     velocity: chord.velocity)
             playedListeners.forEach { $0(played) }
         }
     }
@@ -245,28 +262,36 @@ final class ChordEngine: ObservableObject {
 
     /// Plays a held chord; `chromatic` (a MIDI key in chromatic layout) makes the plain color major.
     /// `instrument`: the keyboard's own sound (nil = the selected one).
-    func press(_ chord: HeldChord, chromatic: Bool = false, velocity: Int = 100, instrument: String? = nil) {
+    /// `time`: when the key went down (MIDI arrival), so recordings keep the real timing.
+    func press(_ chord: HeldChord, chromatic: Bool = false, velocity: Int = 100, instrument: String? = nil,
+               time: Double? = nil) {
         guard held.insert(chord).inserted else { return }
         startChord(id: Self.userId(chord), degree: chord.degree, color: color, source: .user,
                    octave: chord.octave, accidental: chord.accidental, chromatic: chromatic, velocity: velocity,
-                   instrument: instrument, owner: chord.owner)
+                   instrument: instrument, owner: chord.owner, at: time)
     }
 
     /// A single note, as a piano key (MIDI "Notes" layout). `key` identifies the physical key.
-    func playNote(key: String, midi: Int, velocity: Int, instrument: String? = nil, owner: String? = nil) {
+    /// Voice id of a note `LiveFastPath` already sounded on the MIDI thread (it stops it too).
+    static let presoundedVoice = Int.min
+
+    /// `presounded`: it already sounds (MIDI fast path); only the state is recorded. `time`:
+    /// when the key went down (MIDI arrival), so the recorder doesn't see the main-thread delay.
+    func playNote(key: String, midi: Int, velocity: Int, instrument: String? = nil, owner: String? = nil,
+                  presounded: Bool = false, time: Double? = nil) {
         guard heldNotes[key] == nil, (0...127).contains(midi) else { return }
         Synth.shared.start()
-        let voice = output.noteOn(midi: midi, velocity: velocity, instrument: instrument)
-        heldNotes[key] = HeldNote(midi: midi, voice: voice, start: now(), velocity: velocity, owner: owner,
+        let voice = presounded ? Self.presoundedVoice : output.noteOn(midi: midi, velocity: velocity, instrument: instrument)
+        heldNotes[key] = HeldNote(midi: midi, voice: voice, start: time ?? now(), velocity: velocity, owner: owner,
                                   instrument: instrument)
         onNotes?([midi], true)
     }
 
-    func stopNote(key: String) {
+    func stopNote(key: String, time: Double? = nil) {
         guard let note = heldNotes.removeValue(forKey: key) else { return }
-        output.noteOff(note.voice)
+        if note.voice != Self.presoundedVoice { output.noteOff(note.voice) }
         onNotes?([note.midi], false)
-        let end = now()
+        let end = max(note.start, time ?? now())
         noteHistory.append(NoteEvent(midi: note.midi, start: note.start, end: end, owner: note.owner))
         let played = PlayedNote(midi: note.midi, velocity: note.velocity, start: note.start, end: end,
                                 instrument: note.instrument)
@@ -280,34 +305,35 @@ final class ChordEngine: ObservableObject {
         heldNotes.values.map { PlayedNote(midi: $0.midi, velocity: $0.velocity, start: $0.start, end: end, instrument: $0.instrument) }
     }
 
-    /// A single note from loop playback, with the loop's instrument.
-    func startLoopNote(id: String, midi: Int, velocity: Int, instrument: String?) {
+    /// A single note from loop playback, with the loop's instrument. `time`: host time it must
+    /// sound at (loops schedule ahead); nil = now.
+    func startLoopNote(id: String, midi: Int, velocity: Int, instrument: String?, at time: Double? = nil) {
         guard loopNotes[id] == nil, (0...127).contains(midi) else { return }
         Synth.shared.start()
-        loopNotes[id] = (output.noteOn(midi: midi, velocity: velocity, instrument: instrument), midi)
+        loopNotes[id] = (output.noteOn(midi: midi, velocity: velocity, instrument: instrument, at: time), midi)
         onNotes?([midi], true)
     }
 
-    func release(_ chord: HeldChord) {
+    func release(_ chord: HeldChord, time: Double? = nil) {
         held.remove(chord)
-        endChord(id: Self.userId(chord))
+        endChord(id: Self.userId(chord), at: time)
     }
 
     /// Loop playback entry points; ids belong to the caller.
     func startLoopChord(id: String, degree: Degree, color: ChordColor, octave: Int = 0, accidental: Int = 0,
-                        instrument: String? = nil, velocity: Int = 100) {
+                        instrument: String? = nil, velocity: Int = 100, at time: Double? = nil) {
         startChord(id: id, degree: degree, color: color, source: .loop, octave: octave, accidental: accidental,
-                   velocity: velocity, instrument: instrument)
+                   velocity: velocity, instrument: instrument, at: time)
     }
 
-    /// Ends a loop chord or loop note.
-    func endLoopChord(id: String) {
+    /// Ends a loop chord or loop note (at host time `time`, never before it started; nil = now).
+    func endLoopChord(id: String, at time: Double? = nil) {
         if let note = loopNotes.removeValue(forKey: id) {
-            output.noteOff(note.voice, pedal: false)
+            output.noteOff(note.voice, pedal: false, at: time)
             onNotes?([note.midi], false)
             return
         }
-        endChord(id: id)
+        endChord(id: id, at: time)
     }
 
     func stopAll() {
@@ -330,7 +356,7 @@ final class ChordEngine: ObservableObject {
     private func applyDirectionKeys() {
         let resolved = Direction.resolve(heldDirectionKeys)
         direction = resolved
-        let next = resolved?.color ?? .diatonic
+        let next = resolved?.color ?? chordType
         guard next != color else { return }
         color = next
         revoice(color: next) { $0.source == .user }

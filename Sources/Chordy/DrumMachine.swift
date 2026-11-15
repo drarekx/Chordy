@@ -101,8 +101,10 @@ extension Array {
 // MARK: - Clock (audio-side)
 
 /// Fires the bars from a 1 ms timer on its own queue, so the beat doesn't wobble when the
-/// main thread is busy drawing. Talks straight to its own sampler. Each bar is a pattern
-/// already mixed (velocities scaled, muted lanes empty); a chain is several bars in a row.
+/// main thread is busy drawing. Steps sit on the shared `Transport` grid and are handed to the
+/// sampler `lookahead` early with their exact sample time, so they land sample-accurately
+/// (no 1 ms polling or render-slice jitter). Each bar is a pattern already mixed (velocities
+/// scaled, muted lanes empty); a chain is several bars in a row.
 final class DrumClock: @unchecked Sendable {
     struct Bar {
         var steps: [[Int]]
@@ -113,18 +115,25 @@ final class DrumClock: @unchecked Sendable {
     struct State {
         var playing = false
         var bars: [Bar] = []
-        var bpm = 110.0
-        /// Grid time of the next step (before swing) and its index (counts up forever).
-        var gridTime = 0.0
+        /// Transport beat of step 0 and the index of the next step to schedule (counts up forever).
+        var startBeat = 0.0
         var next = 0
         /// The sampler is detached while a kit loads: steps advance silently.
         var loading = false
     }
 
     let sampler = AVAudioUnitSampler()
+    /// Latest hit per note (clock queue only): a note-off only stops its own hit.
+    private var lastHit = [UInt64](repeating: 0, count: 128)
+    private var hits: UInt64 = 0
+    /// Cymbals and open hats ring out; the rest are released after 0.4 s.
+    private static let ringing: Set<UInt8> = [46, 49, 51, 52, 53, 55, 57, 59]
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let queue = DispatchQueue(label: "chordy.drums", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
+    /// How far ahead steps are scheduled: more than the timer's wake-up jitter, small enough that
+    /// edits and pattern launches still feel immediate.
+    static let lookahead = 0.025
     /// Called on the main queue with the bar and step that just played.
     var onStep: ((Int, Int) -> Void)?
 
@@ -138,62 +147,111 @@ final class DrumClock: @unchecked Sendable {
 
     func update(_ body: (inout State) -> Void) { state.withLock { body(&$0) } }
 
-    func start(bars: [Bar], bpm: Double) {
+    /// Starts on the transport: at once when nothing else plays, else on the next bar line;
+    /// `at` forces the first bar onto that transport beat (song playback).
+    func start(bars: [Bar], at beat: Double? = nil) {
+        let joined = Transport.shared.join("drums")
+        let startBeat = beat ?? joined
         state.withLock {
             $0.bars = bars
-            $0.bpm = bpm
-            $0.gridTime = CACurrentMediaTime() + 0.02
+            $0.startBeat = startBeat
             $0.next = 0
             $0.playing = true
         }
     }
 
-    func stop() { state.withLock { $0.playing = false } }
+    func stop() {
+        state.withLock { $0.playing = false }
+        Transport.shared.leave("drums")
+    }
 
     /// Step nearest to `time` (for live recording), 0…15.
     func nearestStep(at time: Double) -> Int {
-        state.withLock { s in
-            let dur = 60 / s.bpm / 4
-            let offset = Int(((time - s.gridTime) / dur).rounded())
-            return ((s.next + offset) % DrumPattern.stepCount + DrumPattern.stepCount) % DrumPattern.stepCount
+        let beat = Transport.shared.beat(at: time)
+        return state.withLock { s in
+            let step = Int(((beat - s.startBeat) * 4).rounded())
+            return (step % DrumPattern.stepCount + DrumPattern.stepCount) % DrumPattern.stepCount
         }
     }
 
+    /// Lane notes of the selected pattern, for hits that arrive off the main thread.
+    private let laneNotes = OSAllocatedUnfairLock(initialState: DrumTrack.allCases.map(\.note))
+
+    func setLaneNotes(_ notes: [UInt8]) { laneNotes.withLock { $0 = notes } }
+
+    /// Lane (0…7) or, negative, a raw GM note (-1 - note): callable from any thread. The
+    /// note goes out on the clock's queue, so the sampler only ever gets events from one thread.
+    func hit(lane: Int, velocity: Int) {
+        queue.async { [weak self] in self?.hitNow(lane: lane, velocity: velocity) }
+    }
+
+    private func hitNow(lane: Int, velocity: Int) {
+        let note: UInt8
+        if lane >= 0 {
+            guard let n = laneNotes.withLock({ $0.indices.contains(lane) ? $0[lane] : nil }) else { return }
+            note = n
+        } else {
+            note = UInt8(max(0, min(127, -1 - lane)))
+        }
+        play(note, velocity: SamplerPlayer.curveValue(velocity))
+    }
+
+    /// From the main thread (panel, Launchkey pads): hop to the clock's queue too.
     func hit(_ note: UInt8, velocity: UInt8) {
+        queue.async { [weak self] in self?.play(note, velocity: velocity) }
+    }
+
+    /// `time`: host time it must sound at (nil = now). Only ever runs on `queue`.
+    private func play(_ note: UInt8, velocity: UInt8, at time: Double? = nil) {
         guard !state.withLock({ $0.loading }) else { return }
-        sampler.startNote(note, withVelocity: velocity, onChannel: 9)
-        let sampler = self.sampler
-        queue.asyncAfter(deadline: .now() + 0.4) { sampler.stopNote(note, onChannel: 9) }
+        AudioClock.send(sampler, 0x99, note, velocity, at: time)
+        hits += 1
+        let mine = hits
+        lastHit[Int(note)] = mine
+        let hold = (Self.ringing.contains(note) ? 2.5 : 0.4) + max(0, (time ?? 0) - CACurrentMediaTime())
+        queue.asyncAfter(deadline: .now() + hold) { [weak self] in
+            guard let self, self.lastHit[Int(note)] == mine else { return }
+            AudioClock.send(self.sampler, 0x89, note, 0, at: nil)
+        }
     }
 
     private func tick() {
         let now = CACurrentMediaTime()
-        let (fire, played) = state.withLock { s -> ([(UInt8, UInt8)], (Int, Int)?) in
-            var fire: [(UInt8, UInt8)] = []
-            var played: (Int, Int)?
-            guard s.playing, !s.bars.isEmpty else { return (fire, played) }
-            let dur = 60 / s.bpm / 4
+        let transport = Transport.shared.snapshot
+        let horizon = now + Self.lookahead
+        let (fire, played) = state.withLock { s -> ([(UInt8, UInt8, Double)], [(Int, Int, Double)]) in
+            var fire: [(UInt8, UInt8, Double)] = []
+            var played: [(Int, Int, Double)] = []
+            guard s.playing, transport.running, !s.bars.isEmpty else { return (fire, played) }
             while true {
                 let index = s.next % DrumPattern.stepCount
                 let barIndex = (s.next / DrumPattern.stepCount) % s.bars.count
                 let bar = s.bars[barIndex]
-                let swing = index % 2 == 1 ? bar.swing * dur : 0
-                guard s.gridTime + swing <= now else { break }
+                let swing = index % 2 == 1 ? bar.swing / 4 : 0
+                let time = transport.time(ofBeat: s.startBeat + Double(s.next) / 4 + swing)
+                guard time <= horizon else { break }
+                // Fell far behind (sleep, debugger): rejoin the grid instead of machine-gunning.
+                if now - time > 0.25 {
+                    s.next = max(s.next + 1, Int(((transport.beat(at: now) - s.startBeat) * 4).rounded(.up)))
+                    continue
+                }
                 if !s.loading {
                     for (lane, row) in bar.steps.enumerated() where row[index] > 0 {
-                        fire.append((bar.notes[lane], UInt8(min(127, row[index]))))
+                        fire.append((bar.notes[lane], UInt8(min(127, row[index])), time))
                     }
                 }
-                played = (barIndex, index)
+                played.append((barIndex, index, time))
                 s.next += 1
-                s.gridTime += dur
-                // Fell far behind (sleep, debugger): skip ahead instead of machine-gunning.
-                if now - s.gridTime > 0.25 { s.gridTime = now }
             }
             return (fire, played)
         }
-        for (note, velocity) in fire { hit(note, velocity: velocity) }
-        if let played, let onStep { DispatchQueue.main.async { onStep(played.0, played.1) } }
+        for (note, velocity, time) in fire { play(note, velocity: velocity, at: time) }
+        // The playhead moves when the step is heard, not when it is scheduled.
+        if let onStep {
+            for (bar, step, time) in played {
+                DispatchQueue.main.asyncAfter(deadline: .now() + max(0, time - now)) { onStep(bar, step) }
+            }
+        }
     }
 }
 
@@ -234,7 +292,7 @@ final class DrumMachine: ObservableObject {
 
     private let engine: ChordEngine
     private let instruments: InstrumentLibrary
-    private let clock = DrumClock()
+    nonisolated private let clock = DrumClock()
     private var attached = false
     private var loadedKit: String?
     private var kitGeneration = 0
@@ -267,19 +325,61 @@ final class DrumMachine: ObservableObject {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.step = step
+                if let song = self.songOrder, !song.isEmpty {
+                    let current = song[bar % song.count]
+                    if self.playingPattern != current { self.playingPattern = current }
+                    return
+                }
                 let order = self.playOrder
                 let position = bar % max(1, order.count)
                 if self.chainPosition != position { self.chainPosition = position }
                 if self.playingPattern != order[position] { self.playingPattern = order[position] }
             }
         }
-        engine.$bpm.sink { [weak self] bpm in self?.clock.update { $0.bpm = Double(bpm) } }.store(in: &cancellables)
     }
 
     var pattern: DrumPattern { patterns[selected] }
 
     /// What the clock plays: the chain (when on and not empty) or the selected pattern.
     private var playOrder: [Int] { chainOn && !chain.isEmpty ? chain : [selected] }
+    /// Song playback: one entry per bar (a pattern, or nil for a silent bar).
+    private var songOrder: [Int?]?
+    /// Song drum track level, applied to the step velocities.
+    private var songGain = 1.0
+
+    private static let silentBar = DrumClock.Bar(steps: Array(repeating: Array(repeating: 0, count: DrumPattern.stepCount),
+                                                             count: DrumPattern.lanes),
+                                                 notes: DrumTrack.allCases.map(\.note), swing: 0)
+
+    private var clockBars: [DrumClock.Bar] {
+        if let songOrder {
+            return songOrder.map { index in
+                guard let index else { return Self.silentBar }
+                var b = bar(index)
+                if songGain != 1 {
+                    b.steps = b.steps.map { $0.map { $0 > 0 ? max(1, min(127, Int((Double($0) * songGain).rounded()))) : 0 } }
+                }
+                return b
+            }
+        }
+        return playOrder.map(bar)
+    }
+
+    /// Song: play these bars from transport beat `beat` (the song player owns the transport).
+    func playSong(_ order: [Int?], at beat: Double, gain: Double = 1) {
+        guard !order.isEmpty else { return }
+        songOrder = order
+        songGain = gain
+        prepareKit()
+        clock.start(bars: clockBars, at: beat)
+        playing = true
+    }
+
+    func stopSong() {
+        guard songOrder != nil else { return }
+        songOrder = nil
+        stop()
+    }
 
     /// A pattern as the clock plays it: lane volumes applied, muted/solo lanes silenced.
     private func bar(_ index: Int) -> DrumClock.Bar {
@@ -296,8 +396,15 @@ final class DrumMachine: ObservableObject {
     }
 
     private func refreshClock() {
-        let bars = playOrder.map(bar)
+        let bars = clockBars
         clock.update { $0.bars = bars }
+        clock.setLaneNotes(DrumTrack.allCases.map { pattern.laneNote($0) })
+    }
+
+    /// Sound a lane (or a raw note, negative) from any thread: the iPad's hits use it.
+    nonisolated var fastHit: @Sendable (Int, Int) -> Void {
+        let clock = self.clock
+        return { lane, velocity in clock.hit(lane: lane, velocity: velocity) }
     }
 
     // MARK: Transport
@@ -306,7 +413,8 @@ final class DrumMachine: ObservableObject {
 
     func play() {
         prepareKit()
-        clock.start(bars: playOrder.map(bar), bpm: Double(engine.bpm))
+        songOrder = nil
+        clock.start(bars: clockBars)
         playing = true
     }
 
@@ -354,6 +462,19 @@ final class DrumMachine: ObservableObject {
     func clear() { edit { p in p = .empty(p.id).with(kit: p.kit) } }
 
     func setKit(_ id: String) { edit { $0.kit = id } }
+
+    /// Opening a project: its patterns and chain replace these.
+    func replaceAll(patterns new: [DrumPattern], chain newChain: [Int], chainOn on: Bool) {
+        stop()
+        var list = Array(new.prefix(DrumPattern.names.count))
+        for (i, name) in DrumPattern.names.enumerated() where i >= list.count { list.append(.empty(name)) }
+        patterns = list
+        chain = newChain.filter { list.indices.contains($0) }
+        chainOn = on
+        selected = 0
+        persist()
+        patternChanged(restartKit: true)
+    }
     func setSwing(_ value: Double) { edit { $0.swing = min(0.5, max(0, value)) } }
     func setVolume(_ value: Double) { edit { $0.volume = min(1, max(0, value)) } }
 
@@ -461,15 +582,24 @@ final class DrumMachine: ObservableObject {
 
     /// A drum hit from a pad (Play mode) or the panel: sounds now, and lands on the nearest
     /// step when recording.
-    func hit(_ track: DrumTrack, velocity: Int) {
+    /// `time`: when it was played (host time), if it reached us late (iPad over Wi-Fi).
+    func hit(_ track: DrumTrack, velocity: Int, sound: Bool = true, at time: Double? = nil) {
         prepareKit()
-        clock.hit(pattern.laneNote(track), velocity: SamplerPlayer.curve(velocity))
+        if sound { clock.hit(pattern.laneNote(track), velocity: SamplerPlayer.curve(velocity)) }
         flash.insert(track)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in self?.flash.remove(track) }
         if recording && playing {
-            let step = clock.nearestStep(at: CACurrentMediaTime())
-            edit { $0.steps[track.rawValue][step] = max(1, min(127, velocity)) }
+            let step = clock.nearestStep(at: time ?? CACurrentMediaTime())
+            // Store what the pad sent (curved), so the sequencer replays it as heard.
+            let heard = Int(SamplerPlayer.curve(velocity))
+            edit { $0.steps[track.rawValue][step] = max(1, min(127, heard)) }
         }
+    }
+
+    /// Any GM drum note (the iPad's extra pads): sounds, not recorded.
+    func hitNote(_ note: UInt8, velocity: Int) {
+        prepareKit()
+        clock.hit(note, velocity: SamplerPlayer.curve(velocity))
     }
 
     // MARK: Sound
@@ -489,7 +619,7 @@ final class DrumMachine: ObservableObject {
             attached = false
         }
         let sampler = clock.sampler
-        DispatchQueue.global(qos: .userInitiated).async {
+        SamplerPlayer.loadQueue.async {
             do {
                 try sampler.loadSoundBankInstrument(at: url, program: kit.program, bankMSB: kit.bankMSB, bankLSB: 0)
             } catch {
@@ -499,6 +629,7 @@ final class DrumMachine: ObservableObject {
                 guard generation == self.kitGeneration else { return }
                 Synth.shared.attach(sampler)
                 self.attached = true
+                sampler.overallGain = SamplerPlayer.headroomDB
                 sampler.volume = Float(self.pattern.volume)
                 self.clock.update { $0.loading = false }
             }

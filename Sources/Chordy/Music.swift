@@ -22,7 +22,24 @@ enum Flavor: String, CaseIterable, Codable {
 }
 
 enum ChordColor: String, CaseIterable, Codable {
-    case diatonic, major, minor, diminished, augmented, maj7, sus2, sus4, add9
+    case diatonic, major, minor, diminished, augmented, maj7, seventh = "7", minor7 = "m7", sus2, sus4, add9
+
+    /// Full name for menus and pickers.
+    var name: String {
+        switch self {
+        case .diatonic: return tr("Del tono")
+        case .major: return tr("Mayor")
+        case .minor: return tr("Menor")
+        case .diminished: return tr("Disminuido")
+        case .augmented: return tr("Aumentado")
+        case .maj7: return "maj7"
+        case .seventh: return tr("Séptima (7)")
+        case .minor7: return tr("Menor 7 (m7)")
+        case .sus2: return "sus2"
+        case .sus4: return "sus4"
+        case .add9: return "add9"
+        }
+    }
 
     /// Short name shown on the wheel.
     var short: String {
@@ -57,6 +74,8 @@ enum ChordColor: String, CaseIterable, Codable {
         case .sus2: return [0, 2, 7]
         case .sus4: return [0, 5, 7]
         case .add9: return [0, 4, 7, 14]
+        case .seventh: return [0, 4, 7, 10]
+        case .minor7: return [0, 3, 7, 10]
         }
     }
 }

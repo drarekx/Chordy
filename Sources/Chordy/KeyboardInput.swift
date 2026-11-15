@@ -63,6 +63,9 @@ final class KeyboardInput {
         if event.modifierFlags.intersection([.command, .control, .option]).isEmpty == false { return false }
         // Typing in a text field (sound or loop names) keeps the keys.
         if event.window?.firstResponder is NSText { return false }
+        // The loop editor has its own keys (space, arrows, delete).
+        let mode = UserDefaults.standard.string(forKey: "mainMode")
+        if mode == "editor" || (mode == "song" && event.keyCode == 49) { return false }
         let down = event.type == .keyDown
 
         if event.keyCode == Self.escape {
