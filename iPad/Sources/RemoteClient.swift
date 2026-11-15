@@ -30,6 +30,8 @@ final class RemoteClient: ObservableObject {
     @Published private(set) var latency: Double?
     /// Keys held on each Mac MIDI keyboard; its own object so only the keyboard drawings redraw.
     let live = LiveKeys()
+    /// Song playhead; its own object so only the song card redraws 8 times a second.
+    let song = SongClock()
 
     private var browser: NWBrowser?
     private var results: [String: NWEndpoint] = [:]
@@ -180,6 +182,10 @@ final class RemoteClient: ObservableObject {
             self.bar = bar
             self.recording = recording
             self.armed = armed
+        case .song(let playing, let beat, let bpm):
+            song.playing = playing
+            song.beat = beat
+            song.bpm = bpm
         case .notes(let device, let midi):
             live.notes[device] = Set(midi)
         case .pong(let id):
@@ -210,4 +216,12 @@ final class RemoteClient: ObservableObject {
 @MainActor
 final class LiveKeys: ObservableObject {
     @Published var notes: [String: Set<Int>] = [:]
+}
+
+/// The Mac's song: playing or not and where (beats from the start).
+@MainActor
+final class SongClock: ObservableObject {
+    @Published var playing = false
+    @Published var beat = 0.0
+    @Published var bpm = 120
 }

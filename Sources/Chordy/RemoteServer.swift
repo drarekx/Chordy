@@ -18,6 +18,10 @@ final class RemoteServer: ObservableObject {
     private let midi: MidiController
     private let sounds: SoundLibrary
     private let instruments: InstrumentLibrary
+    private let song: Song
+    private var songTimer: Timer?
+    /// Notes the iPad's try-out keyboard holds: MIDI note → voice.
+    private var tryVoices: [Int: Int] = [:]
     private var lastNotes: [String: Set<Int>] = [:]
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: Client] = [:]
@@ -35,7 +39,7 @@ final class RemoteServer: ObservableObject {
     }
 
     init(drums: DrumMachine, engine: ChordEngine, keyboards: Keyboards, loops: Loops,
-         midi: MidiController, sounds: SoundLibrary, instruments: InstrumentLibrary) {
+         midi: MidiController, sounds: SoundLibrary, instruments: InstrumentLibrary, song: Song) {
         self.drums = drums
         self.engine = engine
         self.keyboards = keyboards
@@ -43,6 +47,7 @@ final class RemoteServer: ObservableObject {
         self.midi = midi
         self.sounds = sounds
         self.instruments = instruments
+        self.song = song
     }
 
     func start() {
@@ -70,6 +75,14 @@ final class RemoteServer: ObservableObject {
                           sounds.objectWillChange, instruments.objectWillChange, midi.devices.objectWillChange] {
             publisher.sink { [weak self] _ in self?.scheduleState() }.store(in: &cancellables)
         }
+        song.$data.sink { [weak self] _ in self?.scheduleState() }.store(in: &cancellables)
+        // The song's playhead: often while it plays, once when it stops or jumps.
+        song.$playing.removeDuplicates().sink { [weak self] playing in
+            DispatchQueue.main.async { self?.songPlaying(playing) }
+        }.store(in: &cancellables)
+        song.$startBar.removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.sendSong() }
+        }.store(in: &cancellables)
         midi.live.$keyWindow.removeDuplicates().sink { [weak self] _ in self?.scheduleState() }.store(in: &cancellables)
         // Keys held on each MIDI keyboard, sent as they change (the iPad lights them).
         midi.live.$notes.sink { [weak self] notes in self?.sendNotes(notes) }.store(in: &cancellables)
@@ -178,7 +191,7 @@ final class RemoteServer: ObservableObject {
         lastState = state
         broadcast(.state(state))
         sendTick()
-        if force { sendBeat(BeatClock.shared.beat) }
+        if force { sendBeat(BeatClock.shared.beat); sendSong() }
     }
 
     private func sendBeat(_ beat: Int?) {
@@ -186,6 +199,36 @@ final class RemoteServer: ObservableObject {
         broadcast(.beat(inBar: position?.inBar, bar: position?.bar,
                         recording: loops.recorderState == .recording || drums.recording,
                         armed: loops.recorderState == .armed))
+    }
+
+    private func songPlaying(_ playing: Bool) {
+        songTimer?.invalidate()
+        songTimer = nil
+        if playing {
+            let timer = Timer(timeInterval: 0.125, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.sendSong() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            songTimer = timer
+        }
+        sendSong()
+    }
+
+    private func sendSong() {
+        guard !connections.isEmpty else { return }
+        let beat = song.playing ? song.position : Double(song.startBar) * 4
+        broadcast(.song(playing: song.playing, beat: beat, bpm: engine.bpm))
+    }
+
+    /// Same as «Guardar» on the Mac: a factory sound saves as a copy, and keyboards that used
+    /// the old one follow the new one.
+    private func saveSynth(asNew: Bool) {
+        let before = InstrumentLibrary.synth(sounds.selectedId)
+        sounds.save(as: asNew || sounds.selected.isBuiltin ? sounds.draft.name : nil)
+        let after = InstrumentLibrary.synth(sounds.selectedId)
+        if before != after, !asNew {
+            for c in keyboards.configs where c.instrument == before { keyboards.update(c.id) { $0.instrument = after } }
+        }
     }
 
     private func sendNotes(_ notes: [String: Set<Int>]) {
@@ -248,7 +291,12 @@ final class RemoteServer: ObservableObject {
             muted: drums.muted.map(\.rawValue).sorted(), solo: drums.solo?.rawValue,
             chain: drums.chain, chainOn: drums.chainOn, faders: faders,
             loopsPlaying: loops.isPlaying, loopsRecording: loops.isRecording,
-            keyboards: boards, sounds: soundList, favorites: keyboards.favorites)
+            keyboards: boards, sounds: soundList, favorites: keyboards.favorites,
+            songSections: song.sections.map { RemoteSection(id: $0.id, name: $0.name, start: $0.start, bars: $0.bars, color: $0.color) },
+            songBars: song.lengthBars, songHasClips: !song.data.clips.isEmpty,
+            synth: RemoteSynth(library: sounds.all.map { RemoteSoundRef(id: $0.id, name: $0.name, builtin: $0.isBuiltin) },
+                               selectedId: sounds.selectedId, draft: sounds.draft, dirty: sounds.dirty,
+                               audition: keyboards.auditionId))
     }
 
     // MARK: Commands
@@ -301,7 +349,46 @@ final class RemoteServer: ObservableObject {
             let effects = Effects(reverb: clamp(e.reverb), delay: clamp(e.delay), delayTime: max(0.05, clamp(e.delayTime, 1.5)),
                                   feedback: clamp(e.feedback, 0.9), filter: clamp(e.filter))
             keyboards.update(id) { $0.effects = effects.isOff ? nil : effects }
+        case .songTogglePlay: song.togglePlay()
+        case .songPlay(let bar):
+            song.loopRange = nil
+            song.startBar = max(0, bar)
+            song.play(fromBar: max(0, bar))
+        case .songRewind:
+            song.startBar = 0
+            if song.playing { song.play(fromBar: 0) }
+        case .synthSelect(let id): if sounds.all.contains(where: { $0.id == id }) { sounds.select(id) }
+        case .synthDraft(let patch):
+            var p = patch.sanitized()
+            p.id = sounds.draft.id
+            if sounds.selected.isBuiltin { p.name = sounds.draft.name }
+            sounds.draft = p
+        case .synthSave(let asNew): saveSynth(asNew: asNew)
+        case .synthRevert: sounds.revert()
+        case .synthNew: sounds.newSound()
+        case .synthDuplicate(let id): sounds.duplicate(id)
+        case .synthRename(let id, let name): sounds.rename(id, to: name)
+        case .synthDelete(let id):
+            guard let patch = sounds.all.first(where: { $0.id == id }), !patch.isBuiltin else { break }
+            for c in keyboards.configs where c.instrument == InstrumentLibrary.synth(id) {
+                keyboards.update(c.id) { $0.instrument = InstrumentLibrary.synthId }
+            }
+            sounds.remove(id)
+        case .synthAssign(let id):
+            guard keyboards.config(id) != nil else { break }
+            if sounds.selected.isBuiltin && sounds.dirty { saveSynth(asNew: true) }
+            keyboards.setSound(InstrumentLibrary.synth(sounds.selectedId), for: id)
+        case .synthAudition(let id): keyboards.setAudition(id.flatMap { keyboards.config($0) != nil ? $0 : nil })
+        case .synthNoteOn(let midi, let velocity):
+            guard (0...127).contains(midi), tryVoices[midi] == nil else { break }
+            Synth.shared.start()
+            tryVoices[midi] = engine.output.noteOn(midi: midi, velocity: max(1, min(127, velocity)), instrument: InstrumentLibrary.synthId)
+        case .synthNoteOff(let midi):
+            if let voice = tryVoices.removeValue(forKey: midi) { engine.output.noteOff(voice, pedal: false) }
         case .stopAll:
+            for voice in tryVoices.values { engine.output.noteOff(voice, pedal: false) }
+            tryVoices.removeAll()
+            song.stop()
             loops.stopPlayback()
             drums.stop()
             engine.stopAll()

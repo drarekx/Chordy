@@ -75,6 +75,33 @@ struct RemoteSound: Codable, Equatable, Identifiable {
     var download: Int?
 }
 
+/// A section of the song (intro, verse…): where it starts and how long, in bars.
+struct RemoteSection: Codable, Equatable, Identifiable {
+    var id: String
+    var name: String
+    var start: Int
+    var bars: Int
+    var color: Int
+}
+
+/// A synth sound in the library.
+struct RemoteSoundRef: Codable, Equatable, Identifiable {
+    var id: String
+    var name: String
+    var builtin: Bool
+}
+
+/// The synth designer: the library, the sound being edited (with unsaved edits), and which
+/// keyboard is pinned to it.
+struct RemoteSynth: Codable, Equatable {
+    var library: [RemoteSoundRef]
+    var selectedId: String
+    var draft: Patch
+    var dirty: Bool
+    /// Keyboard that plays the edited sound (id), if any.
+    var audition: String?
+}
+
 struct RemoteState: Codable, Equatable {
     var macName: String
     var bpm: Int
@@ -99,6 +126,11 @@ struct RemoteState: Codable, Equatable {
     var sounds: [RemoteSound]?
     /// The eight quick sounds (ids).
     var favorites: [String]?
+    /// The song: its sections, length and whether it has anything to play.
+    var songSections: [RemoteSection]?
+    var songBars: Int?
+    var songHasClips: Bool?
+    var synth: RemoteSynth?
 }
 
 /// Mac → iPad.
@@ -115,6 +147,8 @@ enum RemoteMessage: Codable {
     case beat(inBar: Int?, bar: Int?, recording: Bool, armed: Bool)
     /// Keys held now on a MIDI device (to light them on the iPad drawing).
     case notes(device: String, midi: [Int])
+    /// Song playhead (beats from the start), ~8 times a second while it plays and on changes.
+    case song(playing: Bool, beat: Double, bpm: Int)
 }
 
 /// iPad → Mac.
@@ -155,6 +189,28 @@ enum RemoteCommand: Codable {
     case stopAll
     case setSound(keyboard: String, sound: String)
     case setEffects(keyboard: String, effects: RemoteEffects)
+    case songTogglePlay
+    /// Play the song from a bar (a section's start).
+    case songPlay(fromBar: Int)
+    /// Back to the start (keeps playing if it was).
+    case songRewind
+    case synthSelect(id: String)
+    /// The whole edited sound, sent as a knob moves.
+    case synthDraft(Patch)
+    /// Save over a user sound, or as a new one (factory sounds always make a copy).
+    case synthSave(asNew: Bool)
+    case synthRevert
+    case synthNew
+    case synthDuplicate(id: String)
+    case synthRename(id: String, name: String)
+    case synthDelete(id: String)
+    /// Give the edited sound to a keyboard (saving a copy of an edited factory sound first).
+    case synthAssign(keyboard: String)
+    /// Pin a keyboard to the edited sound (nil: unpin).
+    case synthAudition(keyboard: String?)
+    /// The iPad's try-out keyboard: notes of the edited sound on the Mac.
+    case synthNoteOn(midi: Int, velocity: Int)
+    case synthNoteOff(midi: Int)
 }
 
 /// Splits a TCP byte stream into JSON lines.

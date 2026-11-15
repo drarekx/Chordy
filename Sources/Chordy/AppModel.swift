@@ -41,9 +41,9 @@ final class AppModel: ObservableObject {
         midi.isPlaying = { [unowned loops] in loops.isPlaying }
         midi.watch(loops.objectWillChange)
         midi.watch(drums.objectWillChange)
-        remote = RemoteServer(drums: drums, engine: engine, keyboards: keyboards, loops: loops,
-                              midi: midi, sounds: sounds, instruments: instruments)
         song = Song(engine: engine, loops: loops, drums: drums, instruments: instruments)
+        remote = RemoteServer(drums: drums, engine: engine, keyboards: keyboards, loops: loops,
+                              midi: midi, sounds: sounds, instruments: instruments, song: song)
     }
 
     func start() {

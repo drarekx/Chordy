@@ -100,6 +100,30 @@ final class Keyboards: ObservableObject {
     }
     static let defaultFavorites = ["salamander", "upright", "gu:rhodes", "gu:organ", "gu:strings", "gu:warmpad",
                                    "gu:bass", InstrumentLibrary.synthId]
+    /// Keyboard pinned to the synth sound being edited (to try sounds while designing them): it
+    /// plays `synth`, which follows the selected sound and its unsaved edits. `auditionPrevious`
+    /// is the sound it had, given back when unpinned.
+    @Published private(set) var auditionId: String? = UserDefaults.standard.string(forKey: "auditionKeyboard")
+    private var auditionPrevious: String? = UserDefaults.standard.string(forKey: "auditionPrevious")
+
+    /// Pin a keyboard to the edited synth sound (nil: unpin, the keyboard gets its sound back).
+    func setAudition(_ id: String?) {
+        guard id != auditionId else { return }
+        if let old = auditionId, old != id, let previous = auditionPrevious, config(old)?.instrument == InstrumentLibrary.synthId {
+            auditionId = nil
+            setSound(previous, for: old)
+        }
+        auditionId = nil
+        auditionPrevious = nil
+        if let id, let c = config(id) {
+            auditionPrevious = c.instrument == InstrumentLibrary.synthId ? nil : c.instrument
+            setSound(InstrumentLibrary.synthId, for: id)
+            auditionId = id
+        }
+        UserDefaults.standard.set(auditionId, forKey: "auditionKeyboard")
+        UserDefaults.standard.set(auditionPrevious, forKey: "auditionPrevious")
+    }
+
     /// Zone learning: the next two notes from this keyboard set its low and high keys.
     @Published private(set) var learningZone: String?
     private var learnedLow: Int?
@@ -141,6 +165,13 @@ final class Keyboards: ObservableObject {
         guard c != configs[i] else { return }
         let effectsChanged = c.effects != configs[i].effects
         configs[i] = c
+        // Choosing another sound on the pinned keyboard ends the pin (keeps that sound).
+        if id == auditionId, c.instrument != InstrumentLibrary.synthId {
+            auditionId = nil
+            auditionPrevious = nil
+            UserDefaults.standard.removeObject(forKey: "auditionKeyboard")
+            UserDefaults.standard.removeObject(forKey: "auditionPrevious")
+        }
         if effectsChanged { instruments.effectsChanged(bus: "kb:\(id)") }
     }
 

@@ -14,8 +14,9 @@ struct PhoneView: View {
                 ScrollView {
                     VStack(spacing: 16) {
                         count
-                        tempo(state)
+                        SongCard(client: client, song: client.song, state: state)
                         record(state)
+                        tempo(state)
                         transport(state)
                     }
                     .padding(16)
@@ -206,5 +207,102 @@ struct PhoneView: View {
                 .multilineTextAlignment(.center).foregroundStyle(Pal.text2).padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// The song from the phone: where it is, play / stop, back to the start, and its sections to
+/// jump to (tap one and it plays from there).
+private struct SongCard: View {
+    let client: RemoteClient
+    @ObservedObject var song: SongClock
+    let state: RemoteState
+
+    private var bars: Int { max(1, state.songBars ?? 8) }
+    private var sections: [RemoteSection] { state.songSections ?? [] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("CANCIÓN").font(.system(size: 11, weight: .semibold)).foregroundStyle(Pal.text2).tracking(0.6)
+                Spacer()
+                Text(position).font(.system(size: 13, weight: .semibold, design: .monospaced)).foregroundStyle(Pal.text2)
+            }
+            if state.songHasClips == false {
+                Text("La canción está vacía: móntala en el Mac (modo Canción).")
+                    .font(.system(size: 13)).foregroundStyle(Pal.text3)
+            }
+            progress.frame(height: 26)
+            HStack(spacing: 10) {
+                Button { client.send(.songRewind) } label: {
+                    Image(systemName: "backward.end.fill").font(.system(size: 20, weight: .bold))
+                        .frame(width: 64, height: 64)
+                        .background(Pal.control, in: RoundedRectangle(cornerRadius: 16))
+                }
+                .buttonStyle(.plain)
+                Button { client.send(.songTogglePlay) } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: song.playing ? "stop.fill" : "play.fill").font(.system(size: 24, weight: .bold))
+                        Text(song.playing ? "Parar canción" : "Tocar canción").font(.system(size: 18, weight: .bold))
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 64)
+                    .foregroundStyle(song.playing ? Pal.onAccent : Pal.text)
+                    .background(song.playing ? Pal.accent : Pal.control, in: RoundedRectangle(cornerRadius: 16))
+                }
+                .buttonStyle(.plain)
+                .disabled(state.songHasClips == false)
+            }
+            if !sections.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(sections) { s in
+                            let here = song.playing && song.beat >= Double(s.start * 4) && song.beat < Double((s.start + s.bars) * 4)
+                            Button { client.send(.songPlay(fromBar: s.start)) } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(s.name).font(.system(size: 15, weight: .bold)).lineLimit(1)
+                                    Text("compás \(s.start + 1)").font(.system(size: 11)).foregroundStyle(here ? Pal.window.opacity(0.7) : Pal.text3)
+                                }
+                                .padding(.horizontal, 14).frame(minWidth: 96, minHeight: 54, alignment: .leading)
+                                .foregroundStyle(here ? Pal.window : Pal.text)
+                                .background(here ? color(s) : color(s).opacity(0.22), in: RoundedRectangle(cornerRadius: 12))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                Text("Toca una sección para tocar desde ahí.").font(.system(size: 11)).foregroundStyle(Pal.text3)
+            }
+        }
+        .padding(16)
+        .background(Pal.card, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func color(_ s: RemoteSection) -> Color { Pal.keyboards[s.color % Pal.keyboards.count] }
+
+    private var position: String {
+        let bar = Int(song.beat / 4) + 1, beat = Int(song.beat.truncatingRemainder(dividingBy: 4)) + 1
+        return "\(bar).\(beat) · \(clock(song.beat)) / \(clock(Double(bars) * 4))"
+    }
+
+    private func clock(_ beats: Double) -> String {
+        let s = Int((beats * 60 / Double(max(1, song.bpm))).rounded(.down))
+        return String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    /// Bars with the sections under them and the playhead.
+    private var progress: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 6).fill(Pal.field)
+                ForEach(sections) { s in
+                    RoundedRectangle(cornerRadius: 4).fill(color(s).opacity(0.35))
+                        .frame(width: max(2, w * CGFloat(s.bars) / CGFloat(bars) - 2))
+                        .offset(x: w * CGFloat(s.start) / CGFloat(bars) + 1)
+                        .padding(.vertical, 3)
+                }
+                Rectangle().fill(Pal.text).frame(width: 3)
+                    .offset(x: min(w - 3, w * CGFloat(song.beat / Double(bars * 4))))
+            }
+        }
     }
 }

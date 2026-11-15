@@ -135,6 +135,7 @@ struct SynthStudio: View {
                 Text(tr("Lo usan: %@", users.map(\.name).joined(separator: ", ")))
                     .font(.system(size: 11)).foregroundStyle(Theme.text2).lineLimit(1)
             }
+            AuditionMenu(keyboards: keyboards)
             Menu {
                 ForEach(keyboards.configs) { c in
                     Button(c.name) { assign(to: c.id) }
@@ -231,5 +232,35 @@ private struct TryKeyboard: View {
     private func stop() {
         if let p = playing { engine.output.noteOff(p.voice, pedal: false) }
         playing = nil
+    }
+}
+
+/// Pin a keyboard to the sound being edited: it keeps playing whatever you select or tweak here.
+struct AuditionMenu: View {
+    @ObservedObject var keyboards: Keyboards
+
+    private var pinned: KeyboardConfig? { keyboards.auditionId.flatMap { keyboards.config($0) } }
+
+    var body: some View {
+        Menu {
+            ForEach(keyboards.configs) { c in
+                Button { keyboards.setAudition(c.id) } label: {
+                    if c.id == keyboards.auditionId { Label(c.name, systemImage: "checkmark") } else { Text(c.name) }
+                }
+            }
+            if pinned != nil {
+                Divider()
+                Button(tr("Dejar de probar (vuelve su sonido)")) { keyboards.setAudition(nil) }
+            }
+        } label: {
+            Label(pinned.map { tr("Probando en %@", $0.name) } ?? tr("Probar en un teclado"),
+                  systemImage: pinned == nil ? "pin" : "pin.fill").font(.system(size: 12))
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+        .padding(.horizontal, 10).frame(height: 30)
+        .foregroundStyle(pinned == nil ? Theme.text : Theme.onAccent)
+        .background(pinned == nil ? Theme.control : Theme.accentFill, in: RoundedRectangle(cornerRadius: Theme.radius))
+        .disabled(keyboards.configs.isEmpty)
+        .help(tr("Ese teclado toca el sonido que editas, aunque cambies de sonido en la lista"))
     }
 }
