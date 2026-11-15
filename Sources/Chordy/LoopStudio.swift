@@ -311,7 +311,16 @@ struct LoopStudio: View {
     private func rect(_ e: LoopEvent, _ g: Geo) -> CGRect {
         let p = pitches(of: e)
         let top = g.y(p.max() ?? 60), bottom = g.y(p.min() ?? 60) + g.rowHeight
-        return CGRect(x: g.x(e.start), y: top, width: max(4, CGFloat(e.length) * g.beatWidth), height: bottom - top)
+        let visible = min(e.length, draft.lengthBeats - e.start)
+        return CGRect(x: g.x(e.start), y: top, width: max(4, CGFloat(visible) * g.beatWidth), height: bottom - top)
+    }
+
+    /// The part of a note that crosses the loop's end, drawn again at the start.
+    private func tailRect(_ e: LoopEvent, _ g: Geo) -> CGRect? {
+        let over = e.start + e.length - draft.lengthBeats
+        guard over > 1e-6 else { return nil }
+        let r = rect(e, g)
+        return CGRect(x: g.x(0), y: r.minY, width: max(3, CGFloat(over) * g.beatWidth), height: r.height)
     }
 
     private func snap(_ beat: Double) -> Double { (beat / gridStep).rounded() * gridStep }
@@ -556,6 +565,16 @@ struct LoopStudio: View {
                                      height: g.height)), with: .color(Theme.warn.opacity(0.06)))
         }
         for (i, e) in draft.events.enumerated() {
+            if let t = tailRect(e, g) {
+                let tail = Path(roundedRect: t.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 4)
+                context.fill(tail, with: .color(Theme.accentSoft.opacity(0.7)))
+                context.stroke(tail, with: .color(selected.contains(i) ? Theme.text : Theme.accent),
+                               style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                if t.width > 14 {
+                    context.draw(Text("↪").font(.system(size: 10, weight: .bold)).foregroundColor(Theme.accentText),
+                                 at: CGPoint(x: t.minX + 4, y: t.minY + 7), anchor: .leading)
+                }
+            }
             let r = rect(e, g)
             guard r.maxX >= 0, r.minX <= g.width, r.maxY >= 0, r.minY <= g.height else { continue }
             let isSel = selected.contains(i)
@@ -663,7 +682,8 @@ struct LoopStudio: View {
             for (i, o) in d.originals where draft.events.indices.contains(i) {
                 let raw = d.mode == .create ? max(o.start + gridStep, o.start + o.length + delta) : o.start + o.length + delta
                 let end = free ? raw : snap(raw)
-                draft.events[i].length = min(max(gridStep, end - o.start), draft.lengthBeats - o.start)
+                let cap = d.mode == .resize ? draft.lengthBeats : draft.lengthBeats - o.start
+                draft.events[i].length = min(max(gridStep, end - o.start), cap)
             }
         case .move:
             // ⌥ at the start of a move copies: the originals stay, the copies move.
@@ -684,7 +704,7 @@ struct LoopStudio: View {
             for (i, o) in d.originals where draft.events.indices.contains(i) {
                 let start = free ? (o.start + delta) / LoopMath.fine * LoopMath.fine : snap(o.start + delta)
                 draft.events[i].start = min(max(0, start), draft.lengthBeats - min(o.length, gridStep))
-                draft.events[i].length = min(o.length, draft.lengthBeats - draft.events[i].start)
+                draft.events[i].length = min(o.length, draft.lengthBeats)
                 if o.midi != nil {
                     draft.events[i].midi = max(0, min(127, o.midi! + semis))
                 } else if semis != 0 || draft.events[i].degree != o.degree || draft.events[i].octave != o.octave {
@@ -789,6 +809,13 @@ struct LoopStudio: View {
                 var e = d.events[i]
                 let index = (e.start / g).rounded()
                 var q = index * g
+                // Snapping onto the loop's end: a chord played early across the seam lands on
+                // beat 1 (keeping its end); one merely cut by the end is left alone.
+                if q >= d.lengthBeats - 1e-6 {
+                    let over = e.start + e.length - d.lengthBeats
+                    if over > 1e-6 { d.events[i].start = 0; d.events[i].length = max(g * 0.25, over) }
+                    continue
+                }
                 if swing > 0, Int(index) % 2 == 1 { q += swing * g * 0.5 }
                 let newStart = e.start + (q - e.start) * strength
                 if quantizeEnds {
@@ -798,11 +825,50 @@ struct LoopStudio: View {
                     e.length = max(g * 0.25, newEnd - newStart)
                 }
                 e.start = max(0, min(d.lengthBeats - g * 0.25, newStart))
-                e.length = min(e.length, d.lengthBeats - e.start)
+                e.length = min(e.length, d.lengthBeats)
                 d.events[i] = e
             }
+            d.events = LoopMath.link(d.events, length: d.lengthBeats)
         }
+        selected = []
         sortKeepingSelection()
+    }
+
+    private func linkSeam() {
+        commit { $0.events = LoopMath.link($0.events, length: $0.lengthBeats) }
+        selected = []
+    }
+
+    private func ms(_ beats: Double) -> Int { Int((beats * 60_000 / Double(draft.bpm)).rounded()) }
+
+    /// The loop's seam: link a chord cut by the end with the same one at beat 1, and start the
+    /// first chord early so the repeat flows like the chords inside the loop do.
+    private var seamPanel: some View {
+        let lead = LoopMath.lead(draft.events, length: draft.lengthBeats)
+        let pairs = LoopMath.linkable(draft.events, length: draft.lengthBeats)
+        let step = grid > 0 ? grid : 0.0625
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(tr("Vuelta del loop"))
+            if !pairs.isEmpty {
+                Text(tr("El acorde del final se corta al volver a empezar y el del principio ataca otra vez: enlázalos para que suene seguido."))
+                    .font(.system(size: 11)).foregroundStyle(Theme.warn).fixedSize(horizontal: false, vertical: true)
+                Button { linkSeam() } label: { Text(tr("Enlazar el final con el principio")).frame(maxWidth: .infinity) }
+                    .buttonStyle(AppButtonStyle(kind: .primary, height: 28, fullWidth: true))
+            }
+            HStack(spacing: 4) {
+                Text(tr("Adelantar el primer acorde")).font(.system(size: 11)).foregroundStyle(Theme.text2)
+                Spacer(minLength: 4)
+                IconButton(symbol: "minus", label: tr("Menos"), size: 22) {
+                    commit { $0.events = LoopMath.setLead($0.events, length: $0.lengthBeats, lead: max(0, lead - step)) }
+                }
+                Text(lead > 0 ? "\(ms(lead)) ms" : tr("no")).monospacedText(size: 12).frame(minWidth: 56)
+                IconButton(symbol: "plus", label: tr("Más"), size: 22) {
+                    commit { $0.events = LoopMath.setLead($0.events, length: $0.lengthBeats, lead: lead + step) }
+                }
+            }
+            Text(tr("Lo hace sonar antes del final y seguir al volver a empezar (↪), como cuando adelantas los acordes para unirlos."))
+                .font(.system(size: 10)).foregroundStyle(Theme.text3).fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private func transposeSelection(_ semis: Int) {
@@ -998,6 +1064,7 @@ struct LoopStudio: View {
     private var inspector: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                seamPanel
                 selectionPanel
                 fitPanel
                 abPanel
@@ -1036,7 +1103,7 @@ struct LoopStudio: View {
                 }
                 row(tr("Dura"), String(format: "%.3g", e.length),
                     down: { commit { $0.events[i].length = max(gridStep, e.length - gridStepOrBeat) } },
-                    up: { commit { $0.events[i].length = min($0.lengthBeats - e.start, e.length + gridStepOrBeat) } })
+                    up: { commit { $0.events[i].length = min($0.lengthBeats, e.length + gridStepOrBeat) } })
                 if let midi = e.midi {
                     row(tr("Nota"), Note.at(midi).rawValue + "\(midi / 12 - 1)",
                         down: { commit { $0.events[i].midi = max(0, midi - 1) } },

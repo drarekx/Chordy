@@ -177,7 +177,7 @@ struct LoopPreview: View {
             for e in events {
                 let slot = LoopMath.slot(e, in: events)
                 let rect = CGRect(x: size.width * e.start / length, y: size.height * slot.top + 0.5,
-                                  width: max(2, size.width * e.length / length - 1),
+                                  width: max(2, size.width * min(e.length, length - e.start) / length - 1),
                                   height: max(1.5, size.height * slot.height - 1))
                 context.fill(Path(roundedRect: rect, cornerRadius: 1.5), with: .color(Theme.accentFill))
             }

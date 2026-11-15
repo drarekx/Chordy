@@ -287,6 +287,26 @@ final class Song: ObservableObject {
             guard case .loop(let id) = clip.source, let loop = loops.loops.first(where: { $0.id == id }), loop.lengthBeats > 0 else { continue }
             let clipStart = Double(clip.start) * 4, clipEnd = Double(clip.start + clip.bars) * 4
             guard clipEnd > scheduledTo, clipStart < horizon else { continue }
+            // Notes crossing the loop's seam: the clip starts with their tail.
+            if clipStart >= scheduledTo, clipStart < horizon {
+                for (i, e) in loop.events.enumerated() where e.start + e.length > loop.lengthBeats + 1e-6 {
+                    let end = min(clipStart + e.start + e.length - loop.lengthBeats, clipEnd)
+                    guard end > clipStart else { continue }
+                    let noteId = "song:\(clip.id):tail:\(i)"
+                    let inst = SoundRoute.make(e.instrument ?? loop.instrument ?? instruments.selectedId, bus: "loop:\(id)")
+                    let time = transportTime(ofSongBeat: clipStart)
+                    let velocity = max(1, min(127, Int((Double(e.velocity) * gain).rounded())))
+                    if let midi = e.midi {
+                        engine.startLoopNote(id: noteId, midi: max(0, min(127, midi + (clip.transpose ?? 0))),
+                                             velocity: velocity, instrument: inst, at: time)
+                    } else {
+                        engine.startLoopChord(id: noteId, degree: e.degree, color: e.color, octave: e.octave,
+                                              accidental: e.accidental, instrument: inst, velocity: velocity, at: time)
+                    }
+                    sounding.insert(noteId)
+                    pendingOffs.append((noteId, end))
+                }
+            }
             var rep = max(0, Int(((scheduledTo - clipStart) / loop.lengthBeats).rounded(.down)))
             while true {
                 let base = clipStart + Double(rep) * loop.lengthBeats

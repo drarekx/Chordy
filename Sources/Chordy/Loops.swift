@@ -103,7 +103,72 @@ enum LoopMath {
             e.instrument = n.instrument.map { SoundRoute.parse($0).instrument }
             return e
         }
-        return (length, (chordEvents + noteEvents).sorted { $0.start < $1.start })
+        return (length, link(chordEvents + noteEvents, length: length))
+    }
+
+    /// How near beat 0 a note counts as the loop's first one (when linking).
+    static let firstTolerance = 0.12
+
+    private static func same(_ a: LoopEvent, _ b: LoopEvent) -> Bool {
+        if let m = a.midi { return b.midi == m }
+        return b.midi == nil && a.degree == b.degree && a.accidental == b.accidental && a.octave == b.octave
+    }
+
+    /// Pairs (end note, first note) to link: a note cut by the loop's end (it started up to a
+    /// bar before) and the same note again at beat 0. That's the first chord played early to
+    /// flow into the next round, the way chords are joined inside the loop.
+    static func linkable(_ events: [LoopEvent], length: Double) -> [(end: Int, first: Int)] {
+        var pairs: [(Int, Int)] = []
+        var used = Set<Int>()
+        for (i, e) in events.enumerated() where e.start > firstTolerance && e.start >= length - beatsPerBar
+            && e.start + e.length >= length - 1e-3 && e.start + e.length <= length + 1e-3 {
+            if let j = events.indices.first(where: { !used.contains($0) && $0 != i && events[$0].start <= firstTolerance
+                                                     && same(events[$0], e) }) {
+                pairs.append((i, j))
+                used.insert(j)
+            }
+        }
+        return pairs
+    }
+
+    /// Joins each linkable pair into one note that starts before the end and goes on into the
+    /// first bar: on every repeat it flows over the loop's seam instead of cutting and attacking again.
+    static func link(_ events: [LoopEvent], length: Double) -> [LoopEvent] {
+        let pairs = linkable(events, length: length)
+        guard !pairs.isEmpty else { return events.sorted { $0.start < $1.start } }
+        var out = events
+        for (i, j) in pairs {
+            let firstEnd = events[j].start + events[j].length
+            out[i].length = min(length, (length - events[i].start) + firstEnd)
+            out[i].velocity = max(events[i].velocity, events[j].velocity)
+        }
+        let drop = Set(pairs.map(\.first))
+        return out.enumerated().filter { !drop.contains($0.offset) }.map(\.element).sorted { $0.start < $1.start }
+    }
+
+    /// How early the loop's first chord starts (beats before the end), for the notes that
+    /// cross the seam; 0 when none does.
+    static func lead(_ events: [LoopEvent], length: Double) -> Double {
+        events.filter { $0.start + $0.length > length + 1e-6 }.map { length - $0.start }.max() ?? 0
+    }
+
+    /// Start the loop's first chord `lead` beats before the end (0 = on beat 1 again): the notes
+    /// that cross the seam, or else the ones that start at beat 0, move their start and keep their end.
+    static func setLead(_ events: [LoopEvent], length: Double, lead: Double) -> [LoopEvent] {
+        let crossing = events.indices.filter { events[$0].start + events[$0].length > length + 1e-6 }
+        let group = crossing.isEmpty ? events.indices.filter { events[$0].start <= firstTolerance } : crossing
+        let lead = max(0, min(length / 2, lead))
+        var out = events
+        for i in group {
+            let e = events[i]
+            let start = e.start + e.length > length + 1e-6 ? e.start - length : e.start   // ≤ 0 when crossing
+            let end = start + e.length
+            let newStart = -lead
+            guard end - newStart > 1e-3 else { continue }
+            out[i].length = min(length, end - newStart)
+            out[i].start = newStart < -1e-9 ? length + newStart : 0
+        }
+        return out.sorted { $0.start < $1.start }
     }
 
     /// What falls inside [start, end), re-based so `start` becomes beat 0.
@@ -541,11 +606,19 @@ final class Loops: ObservableObject {
         var due: [(beat: Double, on: Bool, index: Int)] = []
         let firstCycle = Int(((from - anchorBeat) / length).rounded(.down))
         let lastCycle = Int(((to - anchorBeat) / length).rounded(.down))
+        // A note may cross the loop's end (a chord played early that flows into the first
+        // bar): it keeps sounding into the next cycle, and the very first cycle starts with
+        // its tail. Cycle −1 stands for that tail; the previous cycle can still owe note-offs.
         if lastCycle >= 0 {
-            for cycle in max(0, firstCycle)...lastCycle {
+            for cycle in max(-1, firstCycle - 1)...lastCycle {
                 let base = anchorBeat + Double(cycle) * length
                 for (i, event) in loop.events.enumerated() {
-                    let on = base + event.start, off = base + min(length, event.start + event.length)
+                    var on = base + event.start
+                    let off = base + event.start + min(length, event.length)
+                    if cycle < 0 {
+                        guard off > anchorBeat else { continue }
+                        on = anchorBeat
+                    }
                     if on > from && on <= to { due.append((on, true, i)) }
                     if off > from && off <= to { due.append((off, false, i)) }
                 }
