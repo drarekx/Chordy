@@ -109,11 +109,14 @@ private struct LoopRow: View {
                             .onTapGesture(count: 2) { name = loop.name; renaming = true }
                             .help(tr("Doble clic para renombrar"))
                     }
-                    Text("\(LoopMath.formatLength(loop.lengthBeats)) · \(loop.tonic.rawValue) \(loop.flavor.label) · \(loop.bpm) bpm")
+                    Text("\(LoopMath.formatLength(loop.lengthBeats)) · \(loop.tonic.rawValue) \(loop.flavor.label) · \(loop.bpm) bpm"
+                         + (loop.instrument.map { " · " + ($0 == InstrumentLibrary.synthId ? tr("Sintetizador") : Instrument.with($0)?.name ?? "") } ?? ""))
                         .font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.text3)
-                        .lineLimit(1).minimumScaleFactor(0.8)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 4)
+                IconButton(symbol: "slider.horizontal.3", label: tr("Editar: notas, acordes, tono, tempo y efectos")) { loops.studioId = loop.id }
+                IconButton(symbol: "plus.square.on.square", label: tr("Duplicar")) { loops.duplicate(loop.id) }
                 IconButton(symbol: "scissors", label: tr("Recortar"), kind: editing ? .primary : .ghost, action: toggleEditor)
                 IconButton(symbol: "trash", label: tr("Borrar")) { loops.remove(loop.id) }
             }
@@ -123,6 +126,17 @@ private struct LoopRow: View {
         .padding(10)
         .background(loops.selectedId == loop.id ? Theme.navSelected : Theme.card, in: RoundedRectangle(cornerRadius: 10))
         .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.line) }
+        .overlay(alignment: .topTrailing) {
+            if loop.effects != nil {
+                Image(systemName: "sparkles").font(.system(size: 9)).foregroundStyle(Theme.accentText).padding(5)
+                    .help(tr("Con efectos"))
+            }
+        }
+        .sheet(isPresented: Binding(get: { loops.studioId == loop.id }, set: { if !$0 { loops.studioId = nil } })) {
+            ThemedRoot {
+                LoopStudio(loops: loops, instruments: AppModel.shared.instruments, loop: loop) { loops.studioId = nil }
+            }
+        }
     }
 }
 
@@ -134,14 +148,15 @@ struct LoopPreview: View {
 
     var body: some View {
         Canvas { context, size in
-            let rowHeight = size.height / 7
             for bar in 1..<Int(max(1, length / LoopMath.beatsPerBar)) {
                 let x = size.width * CGFloat(Double(bar) * LoopMath.beatsPerBar / length)
                 context.fill(Path(CGRect(x: x, y: 0, width: 1, height: size.height)), with: .color(Theme.line))
             }
             for e in events {
-                let rect = CGRect(x: size.width * e.start / length, y: CGFloat(7 - e.degree) * rowHeight + 0.5,
-                                  width: max(2, size.width * e.length / length - 1), height: rowHeight - 1)
+                let slot = LoopMath.slot(e, in: events)
+                let rect = CGRect(x: size.width * e.start / length, y: size.height * slot.top + 0.5,
+                                  width: max(2, size.width * e.length / length - 1),
+                                  height: max(1.5, size.height * slot.height - 1))
                 context.fill(Path(roundedRect: rect, cornerRadius: 1.5), with: .color(Theme.accentFill))
             }
             if let progress {
@@ -269,10 +284,11 @@ private struct TrimTimeline: View {
                         context.fill(Path(CGRect(x: x(Double(beat)), y: 0, width: 1, height: size.height)),
                                      with: .color(bar ? Theme.lineStrong : Theme.line))
                     }
-                    let rowHeight = size.height / 7
                     for e in events {
-                        let rect = CGRect(x: x(e.start), y: CGFloat(7 - e.degree) * rowHeight + rowHeight * 0.12,
-                                          width: max(1, x(e.length) - 1), height: rowHeight * 0.76)
+                        let slot = LoopMath.slot(e, in: events)
+                        let rowHeight = size.height * slot.height
+                        let rect = CGRect(x: x(e.start), y: size.height * slot.top + rowHeight * 0.12,
+                                          width: max(1, x(e.length) - 1), height: max(1.5, rowHeight * 0.76))
                         context.fill(Path(rect), with: .color(Theme.accentFill))
                     }
                     // Dim what gets cut.

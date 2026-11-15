@@ -79,7 +79,7 @@ enum MidiAction: String, CaseIterable, Codable {
     case colorUp, colorDown, colorLeft, colorRight, octaveDown
     case tonicDown, tonicUp, tonicSet, modePrev, modeNext, modeSet
     case bpmDown, bpmUp, bpmSet, record, play, stop
-    case soundPrev, soundNext
+    case soundPrev, soundNext, keysMode, padsMode
     case cutoff, resonance, filterEnv, attack, decay, sustain, release, vibratoDepth, vibratoRate, volume
     case pitchBend
 
@@ -89,7 +89,7 @@ enum MidiAction: String, CaseIterable, Codable {
              .colorUp, .colorDown, .colorLeft, .colorRight, .octaveDown:
             return .hold
         case .tonicDown, .tonicUp, .modePrev, .modeNext, .bpmDown, .bpmUp, .record, .play, .stop,
-             .soundPrev, .soundNext:
+             .soundPrev, .soundNext, .keysMode, .padsMode:
             return .press
         default:
             return .range
@@ -127,7 +127,7 @@ enum MidiAction: String, CaseIterable, Codable {
 
     var group: Group {
         switch self {
-        case .degree1, .degree2, .degree3, .degree4, .degree5, .degree6, .degree7: return .chords
+        case .degree1, .degree2, .degree3, .degree4, .degree5, .degree6, .degree7, .keysMode, .padsMode: return .chords
         case .colorUp, .colorDown, .colorLeft, .colorRight, .octaveDown: return .color
         case .tonicDown, .tonicUp, .tonicSet, .modePrev, .modeNext, .modeSet: return .keyMode
         case .bpmDown, .bpmUp, .bpmSet, .record, .play, .stop: return .transport
@@ -155,6 +155,8 @@ enum MidiAction: String, CaseIterable, Codable {
         case .record: return tr("Grabar loop")
         case .play: return tr("Reproducir / parar loop")
         case .stop: return tr("Parar todo")
+        case .keysMode: return tr("Teclado: notas ⇄ acordes")
+        case .padsMode: return tr("Pads: acordes → pasos → tocar")
         case .soundPrev: return tr("Sonido anterior")
         case .soundNext: return tr("Sonido siguiente")
         case .cutoff: return tr("Filtro: corte")
@@ -222,8 +224,8 @@ enum MidiPresets {
             out[MidiControl(.note, channel: 10, number: basicBottom[i]).id] = action
             out[MidiControl(.note, channel: 1, number: inControlBottom[i]).id] = action
         }
-        out[MidiControl(.note, channel: 1, number: roundTop).id] = .record
-        out[MidiControl(.note, channel: 1, number: roundBottom).id] = .play
+        out[MidiControl(.note, channel: 1, number: roundTop).id] = .keysMode
+        out[MidiControl(.note, channel: 1, number: roundBottom).id] = .padsMode
         for (i, action) in knobs.enumerated() {
             out[MidiControl(.cc, channel: 1, number: 21 + i).id] = action
         }

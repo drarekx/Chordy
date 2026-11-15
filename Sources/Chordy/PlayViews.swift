@@ -10,9 +10,9 @@ struct PlayHeader: View {
         HStack(alignment: .bottom, spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
                 SectionLabel(tr("Acorde"))
-                Text(engine.activeSymbols.isEmpty ? tr("Toca un acorde") : engine.activeSymbols.joined(separator: " · "))
+                Text(engine.headline.isEmpty ? tr("Toca un acorde") : engine.headline.joined(separator: " · "))
                     .font(.system(size: 30, weight: .semibold, design: .rounded))
-                    .foregroundStyle(engine.activeSymbols.isEmpty ? Theme.text3 : Theme.text)
+                    .foregroundStyle(engine.headline.isEmpty ? Theme.text3 : Theme.text)
                     .lineLimit(1)
                     .minimumScaleFactor(0.5)
                     .accessibilityAddTraits(.updatesFrequently)
@@ -48,6 +48,8 @@ struct PlayHeader: View {
 /// Piano-roll of recent chords: time flows right → left, one row per degree.
 struct ChordDisplay: View {
     @ObservedObject var engine: ChordEngine
+    /// Notes layout: one row per pitch instead of per degree.
+    var notesMode = false
 
     private let labelWidth: CGFloat = 38
     private let paddingY: CGFloat = 10
@@ -65,6 +67,7 @@ struct ChordDisplay: View {
     }
 
     private func draw(_ context: GraphicsContext, _ size: CGSize, at time: Double) {
+        if notesMode { return drawNotes(context, size, at: time) }
         let rows = 7
         let rowHeight = (size.height - paddingY * 2) / CGFloat(rows)
         let rowTop = { (row: Int) in paddingY + CGFloat(rows - row) * rowHeight }
@@ -86,22 +89,125 @@ struct ChordDisplay: View {
         let toX = { (t: Double) in labelWidth + CGFloat((t - start) / window) * plotWidth }
         let barHeight = rowHeight * 0.62
 
-        func bar(_ row: Int, _ source: ChordSource, _ from: Double, _ to: Double) {
+        // A chromatic chord (degree + accidental) sits half a row above its degree, between two rows.
+        func bar(_ row: Int, _ accidental: Int, _ symbol: String, _ source: ChordSource, _ from: Double, _ to: Double) {
             guard to >= start, from <= time else { return }
             let x = toX(max(from, start))
             let w = max(1, toX(min(to, time)) - x)
-            let rect = CGRect(x: x, y: rowTop(row) + (rowHeight - barHeight) / 2, width: w, height: barHeight)
-            context.fill(Path(roundedRect: rect, cornerRadius: 3),
-                         with: .color(source == .user ? Theme.accentFill : Theme.accentBorder))
+            let y = rowTop(row) - CGFloat(accidental) * rowHeight / 2 + (rowHeight - barHeight) / 2
+            let rect = CGRect(x: x, y: y, width: w, height: barHeight)
+            let shape = Path(roundedRect: rect, cornerRadius: 3)
+            let chromatic = accidental != 0
+            // Chromatic chords: outlined, so they read apart from the scale's own chords.
+            if chromatic {
+                context.fill(shape, with: .color(Theme.accentSoft))
+                context.stroke(shape, with: .color(source == .user ? Theme.accent : Theme.accentBorder), lineWidth: 1.5)
+            } else {
+                context.fill(shape, with: .color(source == .user ? Theme.accentFill : Theme.accentBorder))
+            }
+            if w > 28, !symbol.isEmpty {
+                let ink = chromatic ? Theme.accentText : (source == .user ? Theme.onAccent : Theme.text)
+                context.draw(Text(symbol).font(.system(size: 10, weight: .semibold)).foregroundColor(ink),
+                             at: CGPoint(x: x + 5, y: rect.midY), anchor: .leading)
+            }
         }
-        for event in engine.history { bar(event.row, event.source, event.start, event.end) }
-        for chord in engine.sounding { bar(chord.degree, chord.source, chord.start, time) }
+        for event in engine.history { bar(event.row, event.accidental, event.symbol, event.source, event.start, event.end) }
+        for chord in engine.sounding {
+            bar(chord.degree, chord.accidental, engine.symbol(of: chord), chord.source, chord.start, time)
+        }
 
+        drawNow(context, size)
+    }
+
+    /// Notes layout: a piano roll by pitch, C3–C6 at least, growing to fit what was played.
+    private func drawNotes(_ context: GraphicsContext, _ size: CGSize, at time: Double) {
+        let window = engine.windowSeconds
+        let start = time - window
+        let visible = engine.noteHistory.filter { $0.end >= start }.map(\.midi) + engine.heldNotes.values.map(\.midi)
+        let low = min(48, (visible.min() ?? 48) - 2), high = max(84, (visible.max() ?? 84) + 2)
+        let rows = high - low + 1
+        let rowHeight = (size.height - paddingY * 2) / CGFloat(rows)
+        let rowTop = { (midi: Int) in self.paddingY + CGFloat(high - midi) * rowHeight }
+        let black: Set<Int> = [1, 3, 6, 8, 10]
+
+        for midi in low...high {
+            if black.contains(midi % 12) {
+                context.fill(Path(CGRect(x: labelWidth, y: rowTop(midi), width: size.width - labelWidth, height: rowHeight)),
+                             with: .color(Theme.line.opacity(0.35)))
+            }
+            if midi % 12 == 0 {
+                let y = (rowTop(midi) + rowHeight).rounded() + 0.5
+                var line = Path()
+                line.move(to: CGPoint(x: labelWidth, y: y))
+                line.addLine(to: CGPoint(x: size.width, y: y))
+                context.stroke(line, with: .color(Theme.line), lineWidth: 1)
+                context.draw(Text("C\(midi / 12 - 1)").font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(Theme.text3), at: CGPoint(x: 8, y: rowTop(midi) + rowHeight / 2), anchor: .leading)
+            }
+        }
+
+        let plotWidth = size.width - labelWidth
+        let toX = { (t: Double) in self.labelWidth + CGFloat((t - start) / window) * plotWidth }
+        func bar(_ midi: Int, _ from: Double, _ to: Double) {
+            guard to >= start else { return }
+            let x = toX(max(from, start))
+            let w = max(2, toX(min(to, time)) - x)
+            let h = max(2, rowHeight - 1)
+            context.fill(Path(roundedRect: CGRect(x: x, y: rowTop(midi) + (rowHeight - h) / 2, width: w, height: h),
+                              cornerRadius: min(3, h / 2)), with: .color(Theme.accentFill))
+        }
+        for event in engine.noteHistory { bar(event.midi, event.start, event.end) }
+        for note in engine.heldNotes.values { bar(note.midi, note.start, time) }
+        drawNow(context, size)
+    }
+
+    private func drawNow(_ context: GraphicsContext, _ size: CGSize) {
         // "Now" line at the right edge.
         var nowLine = Path()
         nowLine.move(to: CGPoint(x: size.width - 1, y: paddingY))
         nowLine.addLine(to: CGPoint(x: size.width - 1, y: size.height - paddingY))
         context.stroke(nowLine, with: .color(Theme.text2), lineWidth: 1.5)
+    }
+}
+
+// MARK: - Piano strip
+
+/// A keyboard drawing (A0–C8 by default) lighting the notes that sound. `tint` picks the
+/// color of each sounding note, or nil to leave it unlit (a card shows only its own keyboard).
+struct PianoStrip: View {
+    @ObservedObject var engine: ChordEngine
+    var low = 21
+    var high = 108
+    var tint: (NoteLight) -> Color? = { $0.source == .user ? Theme.accentFill : Theme.accentBorder }
+    private static let black: Set<Int> = [1, 3, 6, 8, 10]
+
+    var body: some View {
+        Canvas { context, size in
+            let sounding = engine.soundingNotes
+            let from = Self.black.contains(low % 12) ? low - 1 : low
+            let to = Self.black.contains(high % 12) ? high + 1 : high
+            let whites = (from...to).filter { !Self.black.contains($0 % 12) }
+            let whiteWidth = size.width / CGFloat(max(1, whites.count))
+            var x = [Int: CGFloat]()
+            for (i, midi) in whites.enumerated() { x[midi] = CGFloat(i) * whiteWidth }
+            func lit(_ midi: Int) -> Color? { sounding[midi].flatMap(tint) }
+            for midi in whites {
+                let rect = CGRect(x: x[midi]! + 0.5, y: 0, width: whiteWidth - 1, height: size.height)
+                context.fill(Path(roundedRect: rect, cornerRadius: 3), with: .color(lit(midi) ?? Theme.text.opacity(0.85)))
+                if midi % 12 == 0, whiteWidth > 9 {
+                    context.draw(Text("C\(midi / 12 - 1)").font(.system(size: 8, weight: .medium))
+                        .foregroundColor(lit(midi) == nil ? Theme.window.opacity(0.7) : Theme.onAccent),
+                                 at: CGPoint(x: rect.midX, y: size.height - 7))
+                }
+            }
+            for midi in from...to where Self.black.contains(midi % 12) {
+                guard let left = x[midi - 1] else { continue }
+                let w = whiteWidth * 0.62
+                let rect = CGRect(x: left + whiteWidth - w / 2, y: 0, width: w, height: size.height * 0.6)
+                context.fill(Path(roundedRect: rect, cornerRadius: 2), with: .color(lit(midi) ?? Theme.window))
+            }
+        }
+        .accessibilityLabel(tr("Teclado"))
     }
 }
 
@@ -230,7 +336,7 @@ private struct DegreePad: View {
 
     var body: some View {
         let active = engine.heldDegrees.contains(degree)
-            || engine.sounding.contains { $0.degree == degree && $0.source == .loop }
+            || engine.sounding.contains { $0.degree == degree && $0.accidental == 0 && $0.source == .loop }
         VStack(alignment: .leading) {
             Text(String(Music.key(for: degree)).uppercased())
                 .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -238,9 +344,11 @@ private struct DegreePad: View {
             Spacer(minLength: 12)
             Text(Music.numeral(degree, engine.flavor))
                 .font(.system(size: 12, design: .monospaced))
+                .lineLimit(1).minimumScaleFactor(0.6)
                 .foregroundStyle(active ? Theme.onAccent : Theme.text2)
             Text(Music.symbol(engine.tonic, degree, engine.flavor, engine.color))
                 .font(.system(size: 20, weight: .semibold))
+                .lineLimit(1).minimumScaleFactor(0.5)
                 .foregroundStyle(active ? Theme.onAccent : Theme.text)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)

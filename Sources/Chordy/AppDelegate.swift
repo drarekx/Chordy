@@ -96,8 +96,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showMainWindow() {
         if mainWindow == nil {
-            mainWindow = makeWindow(title: AppInfo.name, size: NSSize(width: 1180, height: 760),
-                                    minSize: NSSize(width: 980, height: 620), autosave: "MainWindow",
+            mainWindow = makeWindow(title: AppInfo.name, size: NSSize(width: 1360, height: 880),
+                                    minSize: NSSize(width: 1120, height: 740), autosave: "StudioWindow",
                                     root: ThemedRoot { MainView() })
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -246,12 +246,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     // dump:<file> writes the sounding chords (degree, octave, MIDI notes), one per line.
                     let lines = AppModel.shared.engine.sounding.map { "\($0.degree) \($0.octave) \($0.notes)" }
                     try? lines.joined(separator: "\n").write(toFile: String(command.dropFirst(5)), atomically: true, encoding: .utf8)
+                case let command? where command.hasPrefix("instrument:"):
+                    // instrument:<id|synth>
+                    let id = String(command.dropFirst(11))
+                    if let instrument = Instrument.with(id) { AppModel.shared.instruments.select(instrument) }
+                    else { AppModel.shared.instruments.selectSynth() }
+                case let command? where command.hasPrefix("download:"):
+                    if let pack = InstrumentPack.with(String(command.dropFirst(9))) { AppModel.shared.instruments.download(pack) }
+                case let command? where command.hasPrefix("layout:"):
+                    // layout:<notes|chromatic|degrees> for every keyboard.
+                    if let layout = KeyLayout(rawValue: String(command.dropFirst(7))) {
+                        for c in AppModel.shared.keyboards.configs { AppModel.shared.keyboards.update(c.id) { $0.layout = layout } }
+                    }
+                case let command? where command.hasPrefix("state:"):
+                    // state:<file> writes instrument, loading flag and pack states.
+                    let lib = AppModel.shared.instruments
+                    let lines = ["selected \(lib.selectedId) loading \(lib.loading)"]
+                        + InstrumentPack.all.map { "\($0.id) \(lib.state($0))" }
+                    try? lines.joined(separator: "\n").write(toFile: String(command.dropFirst(6)), atomically: true, encoding: .utf8)
                 case "record": AppModel.shared.loops.toggleRecord()
                 case "play": AppModel.shared.loops.togglePlay()
                 case let command? where command.hasPrefix("midi:"):
                     // midi:<status>,<data1>,<data2> in decimal, e.g. midi:144,60,100.
                     let bytes = command.dropFirst(5).split(separator: ",").compactMap { UInt8($0) }
                     if bytes.count == 3 { AppModel.shared.midi.inject(bytes[0], bytes[1], bytes[2]) }
+                case let command? where command.hasPrefix("mididev:"):
+                    // mididev:<device>|<status>,<data1>,<data2> as if that device sent it.
+                    let parts = command.dropFirst(8).split(separator: "|", maxSplits: 1)
+                    let bytes = parts.count == 2 ? parts[1].split(separator: ",").compactMap { UInt8($0) } : []
+                    if bytes.count == 3 { AppModel.shared.midi.inject(bytes[0], bytes[1], bytes[2], device: String(parts[0])) }
+                case "drums": AppModel.shared.drums.togglePlay()
+                case let command? where command.hasPrefix("mode:"):
+                    UserDefaults.standard.set(String(command.dropFirst(5)), forKey: "mainMode")
+                case "editloop": AppModel.shared.loops.studioId = AppModel.shared.loops.loops.first?.id
+                case "devices":
+                    // Toggle the device drawing on every keyboard card.
+                    let kb = AppModel.shared.keyboards
+                    for c in kb.configs { kb.update(c.id) { $0.showDevice = $0.showDevice == true ? nil : true } }
+                case let command? where command.hasPrefix("configure:"):
+                    // configure:<index> opens that keyboard's settings; configure:none closes them.
+                    let kb = AppModel.shared.keyboards
+                    kb.editing = Int(command.dropFirst(10)).flatMap { kb.configs.indices.contains($0) ? kb.configs[$0].id : nil }
+                case let command? where command.hasPrefix("pads:"):
+                    if let mode = DrumMachine.PadMode(rawValue: String(command.dropFirst(5))) { AppModel.shared.drums.padMode = mode }
                 case let command? where command.hasPrefix("tab:"):
                     UserDefaults.standard.set(String(command.dropFirst(4)), forKey: "sideTab")
                 case let command? where command.hasPrefix("map:"):

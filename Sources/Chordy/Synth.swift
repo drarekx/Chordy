@@ -81,6 +81,18 @@ final class Synth: @unchecked Sendable {
         }
     }
 
+    /// Adds another sound source (the sampler) to the same engine, straight into the mixer.
+    func attach(_ node: AVAudioNode, to next: AVAudioNode? = nil) {
+        start()
+        engine.attach(node)
+        engine.connect(node, to: next ?? engine.mainMixerNode, format: nil)
+    }
+
+    func detach(_ node: AVAudioNode) {
+        guard node.engine === engine else { return }
+        engine.detach(node)
+    }
+
     /// Output device changed (headphones, AirPods…): start again on the new one.
     private func restart() {
         engine.stop()

@@ -131,11 +131,25 @@ enum Music {
         scales[flavor]![degree - 1].numeral
     }
 
-    /// Semitone offsets from the tonic for a degree, with color applied.
-    static func intervals(_ degree: Degree, _ flavor: Flavor, _ color: ChordColor) -> [Int] {
+    /// Semitone offsets from the tonic for a degree, with color applied. `accidental` raises the
+    /// root (a chromatic chord between two degrees); a raised root has no diatonic quality, so it's major.
+    static func intervals(_ degree: Degree, _ flavor: Flavor, _ color: ChordColor, accidental: Int = 0) -> [Int] {
         let diatonic = scales[flavor]![degree - 1].intervals
-        if color == .diatonic { return diatonic }
-        return color.shape.map { diatonic[0] + $0 }
+        if color == .diatonic && accidental == 0 { return diatonic }
+        let shape = color == .diatonic ? ChordColor.major.shape : color.shape
+        return shape.map { diatonic[0] + accidental + $0 }
+    }
+
+    /// Root offset from the tonic (0…12).
+    static func rootInterval(_ degree: Degree, _ flavor: Flavor) -> Int { scales[flavor]![degree - 1].intervals[0] }
+
+    /// Degree and accidental (0 or +1) whose root is `pitchClass`: every note is a scale degree
+    /// or one semitone above one (the scales have no gaps wider than a tone).
+    static func root(ofPitchClass pitchClass: Int, _ tonic: Note, _ flavor: Flavor) -> (degree: Degree, accidental: Int) {
+        let rel = ((pitchClass - tonic.index) % 12 + 12) % 12
+        for degree in degrees where rootInterval(degree, flavor) == rel { return (degree, 0) }
+        let below = degrees.last { rootInterval($0, flavor) < rel } ?? 1
+        return (below, rel - rootInterval(below, flavor))
     }
 
     private static func triadQuality(_ intervals: [Int]) -> ChordColor {
@@ -145,16 +159,16 @@ enum Music {
         return third == 3 ? .minor : .major
     }
 
-    static func symbol(_ tonic: Note, _ degree: Degree, _ flavor: Flavor, _ color: ChordColor) -> String {
-        let diatonic = scales[flavor]![degree - 1].intervals
-        let root = Note.at(tonic.index + diatonic[0])
-        let quality = color == .diatonic ? triadQuality(diatonic) : color
+    static func symbol(_ tonic: Note, _ degree: Degree, _ flavor: Flavor, _ color: ChordColor, accidental: Int = 0) -> String {
+        let chord = intervals(degree, flavor, color, accidental: accidental)
+        let root = Note.at(tonic.index + chord[0])
+        let quality = color == .diatonic ? triadQuality(chord) : color
         return root.rawValue + quality.symbolSuffix
     }
 
     /// MIDI notes of a chord, voiced from C4 upward.
-    static func midiNotes(_ tonic: Note, _ degree: Degree, _ flavor: Flavor, _ color: ChordColor) -> [Int] {
-        intervals(degree, flavor, color).map { 60 + tonic.index + $0 }
+    static func midiNotes(_ tonic: Note, _ degree: Degree, _ flavor: Flavor, _ color: ChordColor, accidental: Int = 0) -> [Int] {
+        intervals(degree, flavor, color, accidental: accidental).map { 60 + tonic.index + $0 }
     }
 
     static func frequency(_ midi: Double) -> Double { 440 * pow(2, (midi - 69) / 12) }

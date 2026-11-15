@@ -51,7 +51,9 @@ final class MidiIO: @unchecked Sendable {
         for i in 0..<MIDIGetNumberOfSources() {
             let source = MIDIGetSource(i)
             let id = Self.uniqueId(source)
-            guard id != 0, id != ownId else { continue }
+            // Never listen to a Chordy output, ours or another copy's (installed + debug):
+            // each would echo the other's notes forever.
+            guard id != 0, id != ownId, !Self.isChordyOutput(source) else { continue }
             present.insert(id)
             names[id] = Self.name(source)
             if !connected.contains(id) {
@@ -126,6 +128,17 @@ final class MidiIO: @unchecked Sendable {
         var id: MIDIUniqueID = 0
         MIDIObjectGetIntegerProperty(object, kMIDIPropertyUniqueID, &id)
         return id
+    }
+
+    /// A virtual source (no device entity) published by any running Chordy.
+    private static func isChordyOutput(_ source: MIDIEndpointRef) -> Bool {
+        var entity = MIDIEntityRef()
+        let isVirtual = MIDIEndpointGetEntity(source, &entity) != noErr || entity == 0
+        var value: Unmanaged<CFString>?
+        guard isVirtual, MIDIObjectGetStringProperty(source, kMIDIPropertyName, &value) == noErr, let value else {
+            return false
+        }
+        return value.takeRetainedValue() as String == AppInfo.name
     }
 
     private static func name(_ object: MIDIObjectRef) -> String {

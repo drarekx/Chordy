@@ -4,12 +4,23 @@ import SwiftUI
 /// (filter, levels, vibrato and volume even on held notes) and saved on demand.
 struct SoundPanel: View {
     @ObservedObject var sounds: SoundLibrary
+    @ObservedObject var instruments: InstrumentLibrary
 
     private var usesCustomWave: Bool { sounds.draft.oscillators.contains { $0.enabled && $0.wave == .custom } }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                InstrumentPicker(instruments: instruments)
+                if instruments.usesSynth { synthEditor }
+            }
+            .padding(.bottom, 8)
+        }
+    }
+
+    @ViewBuilder
+    private var synthEditor: some View {
+                SectionLabel(tr("Sintetizador"))
                 PresetBar(sounds: sounds)
                 WaveformPreview(patch: sounds.draft).frame(height: 56)
 
@@ -61,9 +72,6 @@ struct SoundPanel: View {
                 section(tr("Salida")) {
                     ParamSlider(label: tr("Volumen"), value: $sounds.draft.volume, range: 0...1, format: Format.percent)
                 }
-            }
-            .padding(.bottom, 8)
-        }
     }
 
     private func section<Content: View>(_ title: String, hint: String? = nil,

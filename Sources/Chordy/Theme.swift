@@ -71,9 +71,11 @@ struct AppButtonStyle: ButtonStyle {
     var kind: Kind = .secondary
     var height: CGFloat = 32
     var fullWidth = false
+    /// Icon-only buttons set 0 so they stay square at their size.
+    var padding: CGFloat = 14
 
     func makeBody(configuration: Configuration) -> some View {
-        StyledButton(configuration: configuration, kind: kind, height: height, fullWidth: fullWidth)
+        StyledButton(configuration: configuration, kind: kind, height: height, fullWidth: fullWidth, padding: padding)
     }
 
     private struct StyledButton: View {
@@ -81,13 +83,14 @@ struct AppButtonStyle: ButtonStyle {
         let kind: Kind
         let height: CGFloat
         let fullWidth: Bool
+        let padding: CGFloat
         @Environment(\.isEnabled) private var isEnabled
 
         var body: some View {
             configuration.label
                 .font(.system(size: 13, weight: kind == .primary ? .semibold : .regular))
                 .foregroundStyle(foreground)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, padding)
                 .frame(maxWidth: fullWidth ? .infinity : nil)
                 .frame(height: height)
                 .background(background, in: RoundedRectangle(cornerRadius: Theme.radius))
@@ -143,9 +146,10 @@ struct IconButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: symbol).font(.system(size: 12, weight: .medium))
+            Image(systemName: symbol).font(.system(size: size < 28 ? 10 : 12, weight: .medium))
+                .frame(width: size)
         }
-        .buttonStyle(AppButtonStyle(kind: kind, height: size))
+        .buttonStyle(AppButtonStyle(kind: kind, height: size, padding: 0))
         .frame(width: size)
         .help(label)
         .accessibilityLabel(label)

@@ -10,6 +10,7 @@ import AppKit
 ///   + / -          bpm
 ///   R              record loop
 ///   P              play / stop loop
+///   1–8            favorite sound on the keyboard played last
 ///   Esc            stop everything
 @MainActor
 final class KeyboardInput {
@@ -17,6 +18,7 @@ final class KeyboardInput {
         var toggleRecord: () -> Void = {}
         var togglePlay: () -> Void = {}
         var panic: () -> Void = {}
+        var pickFavorite: (Int) -> Void = { _ in }
     }
 
     private let engine: ChordEngine
@@ -92,8 +94,13 @@ final class KeyboardInput {
             engine.setOctaveDown(down)
             return true
         }
-        guard down else { return ["z", "c", "q", "e", "+", "=", "-", "_", "r", "p"].contains(key) }
+        let digits: [Character: Int] = ["1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5, "7": 6, "8": 7]
+        guard down else { return ["z", "c", "q", "e", "+", "=", "-", "_", "r", "p"].contains(key) || digits[key] != nil }
         if event.isARepeat { return true }
+        if let slot = digits[key] {
+            shortcuts.pickFavorite(slot)
+            return true
+        }
 
         switch key {
         case "z": engine.shiftTonic(-1)

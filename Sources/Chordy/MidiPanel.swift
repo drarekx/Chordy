@@ -67,26 +67,14 @@ struct MidiPanel: View {
         VStack(alignment: .leading, spacing: 8) {
             SectionLabel(tr("Automapeo"))
             HStack(spacing: 6) {
-                Button(tr("Teclas")) { midi.autoMapKeys() }
+                Button { midi.autoMapKeys() } label: { Text(tr("Añadir teclado")).lineLimit(1).fixedSize() }
                     .buttonStyle(AppButtonStyle(kind: midi.awaitingKey ? .primary : .secondary, fullWidth: true))
                 Button { midi.autoMapLaunchkey() } label: { Text("Launchkey").lineLimit(1).fixedSize() }
                     .buttonStyle(AppButtonStyle(kind: midi.hasLaunchkey ? .primary : .secondary, fullWidth: true))
                 Button(tr("Guiado")) { midi.startGuided() }
                     .buttonStyle(AppButtonStyle(kind: midi.guided ? .primary : .secondary, fullWidth: true))
             }
-            if let channel = midi.keysChannel {
-                HStack(spacing: 6) {
-                    Image(systemName: "pianokeys").foregroundStyle(Theme.accentText)
-                    Text(tr("Teclas en el canal %d: cada octava toca el acorde en su octava.", channel))
-                        .font(.system(size: 11, weight: .medium))
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 4)
-                    Button(tr("Quitar")) { midi.removeKeysZone() }.buttonStyle(AppButtonStyle(kind: .ghost, height: 24))
-                }
-                .padding(8)
-                .background(Theme.accentSoft, in: RoundedRectangle(cornerRadius: Theme.radius))
-            }
-            Text(tr("Teclas: las blancas tocan los grados I–vii en su octava (los botones de octava del teclado suben o bajan el acorde) y las negras mantienen el color (C# min · D# may · F# dim · G# aum · A# octava abajo). Launchkey 25 MK2: pads de abajo grados + octava, de arriba colores · tono · modo · stop; knobs al sonido; transporte. Guiado: recorre cada acción; toca un control o salta."))
+            Text(tr("Añadir teclado: toca una tecla del teclado que quieras añadir (los nuevos se añaden solos). Launchkey 25 MK2: pads de abajo grados + octava, de arriba colores · tono · modo · stop; el redondo de arriba cambia notas ⇄ acordes y el de abajo los pads (acordes → pasos → tocar); knobs al sonido; transporte. Guiado: recorre cada acción; toca un control o salta."))
                 .font(.system(size: 11)).foregroundStyle(Theme.text3)
                 .fixedSize(horizontal: false, vertical: true)
         }
