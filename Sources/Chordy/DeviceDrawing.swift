@@ -95,7 +95,8 @@ struct DeviceDrawing: View {
         if value != nil { context.stroke(arc, with: .color(config.tint), lineWidth: 2) }
         var tick = Path()
         tick.move(to: center)
-        tick.addLine(to: CGPoint(x: center.x + cos(angle.radians) * radius * 0.85, y: center.y + sin(angle.radians) * radius * 0.85))
+        tick.addLine(to: CGPoint(x: center.x + CGFloat(cos(angle.radians)) * radius * 0.85,
+                                 y: center.y + CGFloat(sin(angle.radians)) * radius * 0.85))
         context.stroke(tick, with: .color(.white), lineWidth: 1.6)
         if let label {
             text(context, label, CGPoint(x: center.x, y: center.y + radius + 9), size: max(7, radius * 0.5),
