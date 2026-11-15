@@ -6,7 +6,13 @@ struct ChordyPadsApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView(client: client)
+            Group {
+                if UIDevice.current.userInterfaceIdiom == .phone {
+                    PhoneView(client: client)
+                } else {
+                    RootView(client: client)
+                }
+            }
                 .preferredColorScheme(.dark)
                 .onAppear {
                     client.start()
