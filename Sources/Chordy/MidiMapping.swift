@@ -183,18 +183,17 @@ typealias MidiBindings = [String: MidiAction]
 // MARK: - Presets
 
 enum MidiPresets {
-    /// White keys play degrees (C = I … B = vii°) in every octave; black keys hold colors,
-    /// so one hand picks the color while the other plays. Notes 96+ are left free for
-    /// the Launchkey's InControl pads, which send on channel 1 too.
-    static func keys(channel: Int) -> MidiBindings {
-        let byPitchClass: [Int: MidiAction] = [
-            0: .degree1, 2: .degree2, 4: .degree3, 5: .degree4, 7: .degree5, 9: .degree6, 11: .degree7,
-            1: .colorDown, 3: .colorUp, 6: .colorLeft, 8: .colorRight, 10: .octaveDown,
-        ]
-        var out = MidiBindings()
-        for note in 0..<96 { out[MidiControl(.note, channel: channel, number: note).id] = byPitchClass[note % 12] }
-        return out
-    }
+    /// Keys zone: white keys play degrees (C = I … B = vii°) in the octave of the key
+    /// (C4 = normal register), black keys hold colors, so one hand picks the color while
+    /// the other plays. Notes 96+ stay free for the Launchkey's InControl pads (channel 1 too).
+    static let keyActions: [Int: MidiAction] = [
+        0: .degree1, 2: .degree2, 4: .degree3, 5: .degree4, 7: .degree5, 9: .degree6, 11: .degree7,
+        1: .colorDown, 3: .colorUp, 6: .colorLeft, 8: .colorRight, 10: .octaveDown,
+    ]
+    static let keysRange = 0..<96
+
+    /// Octave of a key relative to C4 (C3 → -1, C5 → +1).
+    static func octave(ofNote note: Int) -> Int { note / 12 - 5 }
 
     /// Pad layout shared by basic and InControl modes, left to right.
     static let topPads: [MidiAction] = [.colorDown, .colorUp, .colorLeft, .colorRight, .tonicDown, .tonicUp, .modeNext, .stop]

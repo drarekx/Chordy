@@ -206,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Debug builds only: `DistributedNotificationCenter` `com.egluu.chordy.debug` with an object
     /// string drives the app for screenshots and checks: `main`, `settings`, `theme:<id>`, `shot:<folder>`,
     /// `press:<1-7>`, `release:<1-7>`, `dir:<direction|none>`, `octave:<0|1>`, `sound:<id>`, `stop`,
-    /// `midi:<status>,<d1>,<d2>`, `tab:<loops|sound|midi>`, `map:<launchkey|keys|guided|clear>`, `record`, `play`.
+    /// `midi:<status>,<d1>,<d2>`, `tab:<loops|sound|midi>`, `map:<launchkey|keys|guided|clear>`, `record`, `play`, `dump:<file>`.
     private func installDebugHook() {
         #if DEBUG
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.egluu.chordy.debug"),
@@ -242,6 +242,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case let command? where command.hasPrefix("sound:"):
                     AppModel.shared.sounds.select(String(command.dropFirst(6)))
                 case "stop": AppModel.shared.engine.stopAll()
+                case let command? where command.hasPrefix("dump:"):
+                    // dump:<file> writes the sounding chords (degree, octave, MIDI notes), one per line.
+                    let lines = AppModel.shared.engine.sounding.map { "\($0.degree) \($0.octave) \($0.notes)" }
+                    try? lines.joined(separator: "\n").write(toFile: String(command.dropFirst(5)), atomically: true, encoding: .utf8)
                 case "record": AppModel.shared.loops.toggleRecord()
                 case "play": AppModel.shared.loops.togglePlay()
                 case let command? where command.hasPrefix("midi:"):

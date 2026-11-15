@@ -15,11 +15,19 @@ struct ChordEvent {
 }
 
 /// A player chord once released; the loop recorder listens for these.
+/// `octave` is where it actually sounded (keyboard octave, minus one with octave-down).
 struct PlayedChord {
     let degree: Degree
     let color: ChordColor
+    var octave = 0
     let start: Double
     let end: Double
+}
+
+/// A held player chord: degree plus octave (a MIDI keyboard can hold the same degree in two octaves).
+struct HeldChord: Hashable {
+    let degree: Degree
+    let octave: Int
 }
 
 /// Current time in seconds, on the same clock as the display.
@@ -48,7 +56,7 @@ final class ChordEngine: ObservableObject {
     @Published private(set) var direction: Direction?
     @Published private(set) var bpm = 110 { didSet { UserDefaults.standard.set(bpm, forKey: "bpm") } }
     @Published private(set) var octaveDown = false
-    @Published private(set) var heldDegrees = Set<Degree>()
+    @Published private(set) var held = Set<HeldChord>()
     @Published private(set) var sounding: [SoundingChord] = []
     @Published private(set) var history: [ChordEvent] = []
 
@@ -58,6 +66,7 @@ final class ChordEngine: ObservableObject {
         let color: ChordColor
         let source: ChordSource
         let start: Double
+        let octave: Int
         let octaveDown: Bool
         let notes: [Int]
         var voices: [Int]
@@ -83,6 +92,9 @@ final class ChordEngine: ObservableObject {
         }
     }
 
+    /// Degrees held by the player, in any octave.
+    var heldDegrees: Set<Degree> { Set(held.map(\.degree)) }
+
     /// Seconds of history on the display: 8 beats.
     var windowSeconds: Double { 480 / Double(bpm) }
 
@@ -96,15 +108,16 @@ final class ChordEngine: ObservableObject {
 
     // MARK: - Chords
 
-    private func startChord(id: String, degree: Degree, color: ChordColor, source: ChordSource) {
+    private func startChord(id: String, degree: Degree, color: ChordColor, source: ChordSource, octave: Int = 0) {
         guard !sounding.contains(where: { $0.id == id }) else { return }
         Synth.shared.start()
         let sound = patch()
-        let shift = source == .user && octaveDown ? -12 : 0
-        let notes = Music.midiNotes(tonic, degree, flavor, color).map { $0 + shift }
+        let down = source == .user && octaveDown
+        let shift = octave * 12 + (down ? -12 : 0)
+        let notes = Music.midiNotes(tonic, degree, flavor, color).map { $0 + shift }.filter { (0...127).contains($0) }
         let voices = notes.map { Synth.shared.noteOn(midi: $0, patch: sound) }
         sounding.append(SoundingChord(id: id, degree: degree, color: color, source: source, start: now(),
-                                      octaveDown: shift != 0, notes: notes, voices: voices))
+                                      octave: octave, octaveDown: down, notes: notes, voices: voices))
         onNotes?(notes, true)
     }
 
@@ -116,7 +129,8 @@ final class ChordEngine: ObservableObject {
         let end = now()
         history.append(ChordEvent(row: chord.degree, color: chord.color, source: chord.source, start: chord.start, end: end))
         if chord.source == .user {
-            let played = PlayedChord(degree: chord.degree, color: chord.color, start: chord.start, end: end)
+            let played = PlayedChord(degree: chord.degree, color: chord.color,
+                                     octave: chord.octave - (chord.octaveDown ? 1 : 0), start: chord.start, end: end)
             playedListeners.forEach { $0(played) }
         }
     }
@@ -125,33 +139,34 @@ final class ChordEngine: ObservableObject {
     private func revoice(color next: ChordColor? = nil, _ matches: (SoundingChord) -> Bool) {
         for chord in sounding where matches(chord) {
             endChord(id: chord.id, release: 0.05)
-            startChord(id: chord.id, degree: chord.degree, color: next ?? chord.color, source: chord.source)
+            startChord(id: chord.id, degree: chord.degree, color: next ?? chord.color, source: chord.source,
+                       octave: chord.octave)
         }
     }
 
-    private static func userId(_ degree: Degree) -> String { "user:\(degree)" }
+    private static func userId(_ degree: Degree, _ octave: Int) -> String { "user:\(degree):\(octave)" }
 
-    func pressDegree(_ degree: Degree) {
-        guard !heldDegrees.contains(degree) else { return }
-        heldDegrees.insert(degree)
-        startChord(id: Self.userId(degree), degree: degree, color: color, source: .user)
+    /// Plays a degree; `octave` moves it up or down from the normal register (C4).
+    func pressDegree(_ degree: Degree, octave: Int = 0) {
+        guard held.insert(HeldChord(degree: degree, octave: octave)).inserted else { return }
+        startChord(id: Self.userId(degree, octave), degree: degree, color: color, source: .user, octave: octave)
     }
 
-    func releaseDegree(_ degree: Degree) {
-        heldDegrees.remove(degree)
-        endChord(id: Self.userId(degree))
+    func releaseDegree(_ degree: Degree, octave: Int = 0) {
+        held.remove(HeldChord(degree: degree, octave: octave))
+        endChord(id: Self.userId(degree, octave))
     }
 
     /// Loop playback entry points; ids belong to the caller.
-    func startLoopChord(id: String, degree: Degree, color: ChordColor) {
-        startChord(id: id, degree: degree, color: color, source: .loop)
+    func startLoopChord(id: String, degree: Degree, color: ChordColor, octave: Int = 0) {
+        startChord(id: id, degree: degree, color: color, source: .loop, octave: octave)
     }
 
     func endLoopChord(id: String) { endChord(id: id) }
 
     func stopAll() {
         for chord in sounding { endChord(id: chord.id, release: 0.1) }
-        heldDegrees.removeAll()
+        held.removeAll()
     }
 
     func onChordPlayed(_ listener: @escaping (PlayedChord) -> Void) { playedListeners.append(listener) }
@@ -159,7 +174,8 @@ final class ChordEngine: ObservableObject {
     /// Player chords still sounding, closed at `end`.
     func heldChords(end: Double = now()) -> [PlayedChord] {
         sounding.filter { $0.source == .user }
-            .map { PlayedChord(degree: $0.degree, color: $0.color, start: $0.start, end: end) }
+            .map { PlayedChord(degree: $0.degree, color: $0.color, octave: $0.octave - ($0.octaveDown ? 1 : 0),
+                               start: $0.start, end: end) }
     }
 
     // MARK: - Color, octave, key, mode, tempo

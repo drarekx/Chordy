@@ -7,8 +7,28 @@ import Foundation
 struct LoopEvent: Codable, Equatable {
     var degree: Degree
     var color: ChordColor
+    /// Octave it was played in (0 = normal register).
+    var octave = 0
     var start: Double
     var length: Double
+
+    init(degree: Degree, color: ChordColor, octave: Int = 0, start: Double, length: Double) {
+        self.degree = degree
+        self.color = color
+        self.octave = octave
+        self.start = start
+        self.length = length
+    }
+
+    /// Loops saved before octaves existed have no `octave`.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        degree = try c.decode(Degree.self, forKey: .degree)
+        color = try c.decode(ChordColor.self, forKey: .color)
+        octave = try c.decodeIfPresent(Int.self, forKey: .octave) ?? 0
+        start = try c.decode(Double.self, forKey: .start)
+        length = try c.decode(Double.self, forKey: .length)
+    }
 }
 
 struct Loop: Codable, Equatable, Identifiable {
@@ -39,7 +59,7 @@ enum LoopMath {
             let from = max(0, snap(toBeats(c.start)))
             let to = min(length, max(from + quantum, snap(toBeats(c.end))))
             guard from < length, to > from else { return nil }
-            return LoopEvent(degree: c.degree, color: c.color, start: from, length: to - from)
+            return LoopEvent(degree: c.degree, color: c.color, octave: c.octave, start: from, length: to - from)
         }
         return (length, events.sorted { $0.start < $1.start })
     }
@@ -49,7 +69,7 @@ enum LoopMath {
         events.compactMap { e in
             let from = max(e.start, start), to = min(e.start + e.length, end)
             guard to - from > epsilon else { return nil }
-            return LoopEvent(degree: e.degree, color: e.color, start: from - start, length: to - from)
+            return LoopEvent(degree: e.degree, color: e.color, octave: e.octave, start: from - start, length: to - from)
         }
     }
 
@@ -60,9 +80,13 @@ enum LoopMath {
         return events.flatMap { e -> [LoopEvent] in
             let start = (e.start + shift).truncatingRemainder(dividingBy: length)
             let end = start + e.length
-            if end <= length + epsilon { return [LoopEvent(degree: e.degree, color: e.color, start: start, length: e.length)] }
-            return [LoopEvent(degree: e.degree, color: e.color, start: start, length: length - start),
-                    LoopEvent(degree: e.degree, color: e.color, start: 0, length: end - length)]
+            var first = e, second = e
+            first.start = start
+            if end <= length + epsilon { return [first] }
+            first.length = length - start
+            second.start = 0
+            second.length = end - length
+            return [first, second]
         }
         .sorted { $0.start < $1.start }
     }
@@ -137,7 +161,7 @@ final class Loops: ObservableObject {
             }
         }
         // The take begins with the first chord after arming.
-        engine.$heldDegrees
+        engine.$held
             .receive(on: RunLoop.main)
             .sink { [weak self] held in
                 if self?.recorderState == .armed, !held.isEmpty { self?.begin() }
@@ -234,7 +258,7 @@ final class Loops: ObservableObject {
     private func finishTake() {
         let end = now()
         let chords = (captured + engine.heldChords(end: end)).map {
-            PlayedChord(degree: $0.degree, color: $0.color, start: max($0.start, takeStart), end: $0.end)
+            PlayedChord(degree: $0.degree, color: $0.color, octave: $0.octave, start: max($0.start, takeStart), end: $0.end)
         }
         let start = takeStart, bpm = takeBpm, tonic = takeTonic, flavor = takeFlavor
         resetRecorder()
@@ -313,7 +337,7 @@ final class Loops: ObservableObject {
         }
         for (i, event) in loop.events.enumerated() where !sounding.contains(i) {
             if position >= event.start && position < event.start + event.length {
-                engine.startLoopChord(id: chordId(loop, i), degree: event.degree, color: event.color)
+                engine.startLoopChord(id: chordId(loop, i), degree: event.degree, color: event.color, octave: event.octave)
                 sounding.insert(i)
             }
         }

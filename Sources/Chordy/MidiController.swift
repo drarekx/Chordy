@@ -19,6 +19,10 @@ final class MidiController: ObservableObject {
     @Published private(set) var learning: MidiAction?
     @Published private(set) var guided = false
     @Published private(set) var awaitingKey = false
+    /// Channel whose keys play chords in their own octave (the "Keys" auto-map), or nil.
+    @Published private(set) var keysChannel: Int? = UserDefaults.standard.object(forKey: "keysChannel") as? Int {
+        didSet { UserDefaults.standard.set(keysChannel, forKey: "keysChannel") }
+    }
     @Published private(set) var lastEvent: Monitor?
     /// Light the Launchkey pads (switches it to InControl mode).
     @Published var lightsEnabled = UserDefaults.standard.bool(forKey: "launchkeyLights") {
@@ -44,6 +48,8 @@ final class MidiController: ObservableObject {
 
     /// Hold actions engaged per control id, so the release undoes the right one.
     private var holds: [String: MidiAction] = [:]
+    /// Keys-zone degrees held per control id, with their octave.
+    private var keyHolds: [String: HeldChord] = [:]
     private var lights: [Int: UInt8] = [:]
     private var lightsScheduled = false
     private var cancellables = Set<AnyCancellable>()
@@ -64,6 +70,22 @@ final class MidiController: ObservableObject {
                 if let control = MidiControl(id: pair.key), let action = MidiAction(rawValue: pair.value),
                    action.accepts(control) { out[pair.key] = action }
             }
+            migrateKeysPreset()
+        }
+    }
+
+    /// Earlier versions saved the Keys preset as one binding per note, without octaves.
+    /// Turn such a channel into a keys zone so both octaves (and the octave buttons) work.
+    private func migrateKeysPreset() {
+        for channel in 1...16 {
+            let ids = MidiPresets.keysRange.map { MidiControl(.note, channel: channel, number: $0).id }
+            let matching = ids.filter { id in
+                guard let control = MidiControl(id: id), let action = bindings[id] else { return false }
+                return MidiPresets.keyActions[control.number % 12] == action
+            }
+            guard matching.count >= 84 else { continue }
+            for id in matching { bindings[id] = nil }
+            if keysChannel == nil { keysChannel = channel }
         }
     }
 
@@ -138,6 +160,22 @@ final class MidiController: ObservableObject {
         releaseHolds()
         cancelLearn()
         bindings = [:]
+        keysChannel = nil
+    }
+
+    func removeKeysZone() {
+        releaseHolds()
+        keysChannel = nil
+    }
+
+    /// Make a channel's keys play chords; per-note bindings there would shadow it, so drop them.
+    private func setKeysZone(_ channel: Int) {
+        releaseHolds()
+        for note in MidiPresets.keysRange {
+            let id = MidiControl(.note, channel: channel, number: note).id
+            if bindings[id] != nil { bindings[id] = nil }
+        }
+        keysChannel = channel
     }
 
     private func apply(_ preset: MidiBindings) {
@@ -193,7 +231,7 @@ final class MidiController: ObservableObject {
 
         if awaitingKey, event.control.kind == .note, event.pressed {
             awaitingKey = false
-            apply(MidiPresets.keys(channel: event.control.channel))
+            setKeysZone(event.control.channel)
             return
         }
         if learning != nil {
@@ -202,10 +240,36 @@ final class MidiController: ObservableObject {
         }
 
         let action = bindings[id]
+        if action == nil, let keyAction = keyZoneAction(event.control) {
+            let octave = MidiPresets.octave(ofNote: event.control.number)
+            let label = keyAction.degree == nil || octave == 0
+                ? keyAction.label : tr("%@ · octava %@", keyAction.label, octave > 0 ? "+\(octave)" : "\(octave)")
+            lastEvent = Monitor(label: event.control.label, device: message.device,
+                                value: Int((event.value * 127).rounded()), action: label)
+            playKey(id, keyAction, octave: octave, pressed: event.pressed, event: event)
+            return
+        }
         lastEvent = Monitor(label: event.control.label, device: message.device,
                             value: Int((event.value * 127).rounded()), action: action?.label)
         guard let action else { return }
         dispatch(id, action, event)
+    }
+
+    private func keyZoneAction(_ control: MidiControl) -> MidiAction? {
+        guard control.kind == .note, control.channel == keysChannel,
+              MidiPresets.keysRange.contains(control.number) else { return nil }
+        return MidiPresets.keyActions[control.number % 12]
+    }
+
+    private func playKey(_ id: String, _ action: MidiAction, octave: Int, pressed: Bool, event: MidiEvent) {
+        guard let degree = action.degree else { return dispatch(id, action, event) }
+        if pressed, keyHolds[id] == nil {
+            let chord = HeldChord(degree: degree, octave: octave)
+            keyHolds[id] = chord
+            engine.pressDegree(degree, octave: octave)
+        } else if !pressed, let chord = keyHolds.removeValue(forKey: id) {
+            engine.releaseDegree(chord.degree, octave: chord.octave)
+        }
     }
 
     private func dispatch(_ id: String, _ action: MidiAction, _ event: MidiEvent) {
@@ -306,6 +370,8 @@ final class MidiController: ObservableObject {
     private func releaseHolds() {
         for action in holds.values { setHold(action, false) }
         holds.removeAll()
+        for chord in keyHolds.values { engine.releaseDegree(chord.degree, octave: chord.octave) }
+        keyHolds.removeAll()
     }
 
     // MARK: - Output
