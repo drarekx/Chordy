@@ -48,6 +48,7 @@ final class AppModel: ObservableObject {
 
     func start() {
         Synth.shared.start()
+        AudioOutputs.shared.start()
         instruments.restore()
         keyboard.start()
         midi.start()

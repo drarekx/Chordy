@@ -59,6 +59,8 @@ final class Synth: @unchecked Sendable {
     private var bend = 0.0
 
     private(set) var running = false
+    /// Output device chosen in Chordy; nil = the system's (the engine follows it by itself).
+    private var outputDevice: AudioDeviceID?
     private var nextId = 1
 
     private init() {
@@ -170,6 +172,15 @@ final class Synth: @unchecked Sendable {
     }
 
     #if DEBUG
+    /// The device the output unit is on now.
+    func debugOutputDevice() -> AudioDeviceID {
+        guard let unit = engine.outputNode.audioUnit else { return 0 }
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &id, &size)
+        return id
+    }
+
     /// Voices alive per slot and the slots in use (debug only; racy read, fine for a check).
     func debugSlots() -> String {
         "voices=\(voices.map(\.count)) buses=\(slotByBus)"
@@ -188,9 +199,40 @@ final class Synth: @unchecked Sendable {
         engine.detach(node)
     }
 
-    /// Output device changed (headphones, AirPods…): start again on the new one.
+    /// Send the sound to a device (nil = the system output). Stops the engine for a moment.
+    func setOutputDevice(_ device: AudioDeviceID?) {
+        guard device != outputDevice else { return }
+        outputDevice = device
+        guard running else { return }
+        engine.stop()
+        route()
+        lowerLatency()
+        do { try engine.start() } catch { NSLog("Chordy: audio engine restart failed: \(error)") }
+    }
+
+    /// Point the output unit at the chosen device, or at the system's again.
+    private func route() {
+        guard let unit = engine.outputNode.audioUnit else { return }
+        var id = outputDevice ?? Self.systemOutput() ?? 0
+        guard id != 0 else { return }
+        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                             &id, UInt32(MemoryLayout<AudioDeviceID>.size))
+    }
+
+    private static func systemOutput() -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id) == noErr else { return nil }
+        return id
+    }
+
+    /// Output device changed (headphones, AirPods…): start again on the new one (or keep the
+    /// one chosen in Chordy).
     private func restart() {
         engine.stop()
+        route()
         lowerLatency()
         do { try engine.start() } catch { NSLog("Chordy: audio engine restart failed: \(error)") }
     }

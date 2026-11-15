@@ -244,7 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case "stop": AppModel.shared.engine.stopAll()
                 case let command? where command.hasPrefix("dump:"):
                     // dump:<file> writes the sounding chords (degree, octave, MIDI notes), one per line.
-                    let lines = AppModel.shared.engine.sounding.map { "\($0.degree) \($0.octave) \($0.notes)" }
+                    let lines = AppModel.shared.engine.sounding.map { "\($0.degree) \($0.octave) \($0.notes) \($0.id) \(String(format: "%.3f", $0.start))" }
                     try? lines.joined(separator: "\n").write(toFile: String(command.dropFirst(5)), atomically: true, encoding: .utf8)
                 case let command? where command.hasPrefix("instrument:"):
                     // instrument:<id|synth>
@@ -283,6 +283,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if let c = ChordColor(rawValue: String(command.dropFirst(10))) { AppModel.shared.engine.chordType = c }
                 case let command? where command.hasPrefix("synthslots:"):
                     try? Synth.shared.debugSlots().write(toFile: String(command.dropFirst(11)), atomically: true, encoding: .utf8)
+                case let command? where command.hasPrefix("audioout:"):
+                    // audioout:<uid|system> picks the output; audiodump:<file> lists devices and the one in use.
+                    let uid = String(command.dropFirst(9))
+                    AudioOutputs.shared.select(uid == "system" ? nil : uid)
+                case let command? where command.hasPrefix("audiodump:"):
+                    let o = AudioOutputs.shared
+                    let lines = o.devices.map { "\($0.id) \($0.uid) | \($0.name)" }
+                        + ["selected=\(o.selectedUID ?? "system") current=\(o.current?.name ?? "-") engine=\(Synth.shared.debugOutputDevice())"]
+                    try? lines.joined(separator: "\n").write(toFile: String(command.dropFirst(10)), atomically: true, encoding: .utf8)
                 case "editloop":
                     AppModel.shared.loops.studioId = AppModel.shared.loops.loops.first?.id
                     UserDefaults.standard.set("editor", forKey: "mainMode")

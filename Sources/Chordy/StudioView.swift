@@ -122,6 +122,7 @@ struct StudioHeader: View {
             BeatIndicator(loops: loops, drums: drums)
             Headline(engine: engine).frame(maxWidth: .infinity, alignment: .leading)
             KeyAndTempo(engine: engine)
+            AudioOutputMenu()
             ConnectedBadge(keyboards: keyboards, devices: midi.devices)
             IconButton(symbol: "arrow.up.left.and.arrow.down.right", label: tr("Pantalla completa")) {
                 NSApp.keyWindow?.toggleFullScreen(nil)
