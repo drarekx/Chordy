@@ -183,7 +183,52 @@ final class InstrumentLibrary: NSObject, ObservableObject, URLSessionDownloadDel
     }
 
     /// Load what was selected last time (call once audio is running).
-    func restore() { if let instrument = selected { _ = player(for: instrument.id) } }
+    func restore() {
+        if let instrument = selected { _ = player(for: instrument.id) }
+        for pack in InstrumentPack.all { slimIfNeeded(pack) }
+    }
+
+    /// Banks too big for AUSampler (it drops the left channel of part of them): rewritten once
+    /// with every n-th velocity layer. Salamander: 16 → 8 layers, 1.27 GB → 0.64 GB.
+    private static let slimLayers: [String: Int] = ["salamander": 2]
+    private static func slimKey(_ id: String) -> String { "slimmed.\(id)" }
+
+    private func slimIfNeeded(_ pack: InstrumentPack, then done: (() -> Void)? = nil) {
+        guard let every = Self.slimLayers[pack.id], !UserDefaults.standard.bool(forKey: Self.slimKey(pack.id)),
+              let url = fileURL(pack) else {
+            done?()
+            return
+        }
+        states[pack.id] = .installing
+        let temp = Self.directory.appendingPathComponent("\(pack.id).slim.sf2")
+        DispatchQueue.global(qos: .utility).async {
+            var ok = true
+            do {
+                try? FileManager.default.removeItem(at: temp)
+                try SF2Slimmer.reduceLayers(source: url, destination: temp, every: every)
+                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                try FileManager.default.moveItem(at: temp, to: url)
+            } catch {
+                NSLog("Chordy: could not slim \(pack.id): \(error)")
+                try? FileManager.default.removeItem(at: temp)
+                ok = false
+            }
+            DispatchQueue.main.async {
+                if ok { UserDefaults.standard.set(true, forKey: Self.slimKey(pack.id)) }
+                self.states[pack.id] = self.fileURL(pack) != nil ? .ready : .missing
+                if ok { self.reloadPlayers(of: pack) }
+                done?()
+            }
+        }
+    }
+
+    /// Load the bank again into every sampler that uses it (after it was rewritten).
+    private func reloadPlayers(of pack: InstrumentPack) {
+        for (key, player) in players {
+            guard let instrument = Instrument.with(SoundRoute.parse(key).instrument), instrument.pack == pack.id else { continue }
+            load(instrument, into: player)
+        }
+    }
 
     func selectSynth() {
         pendingSelection = nil
@@ -295,6 +340,7 @@ final class InstrumentLibrary: NSObject, ObservableObject, URLSessionDownloadDel
             players[key] = nil
         }
         try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        UserDefaults.standard.removeObject(forKey: Self.slimKey(pack.id))
         states[pack.id] = .missing
     }
 
@@ -363,9 +409,16 @@ final class InstrumentLibrary: NSObject, ObservableObject, URLSessionDownloadDel
             }
             try? FileManager.default.removeItem(at: work)
             DispatchQueue.main.async {
-                self.states[pack.id] = ok ? .ready : .failed(tr("No se encontró el instrumento en la descarga"))
-                if ok, let id = self.pendingSelection, let instrument = Instrument.with(id), instrument.pack == pack.id {
-                    self.select(instrument)
+                guard ok else {
+                    self.states[pack.id] = .failed(tr("No se encontró el instrumento en la descarga"))
+                    return
+                }
+                UserDefaults.standard.removeObject(forKey: Self.slimKey(pack.id))
+                self.slimIfNeeded(pack) {
+                    self.states[pack.id] = .ready
+                    if let id = self.pendingSelection, let instrument = Instrument.with(id), instrument.pack == pack.id {
+                        self.select(instrument)
+                    }
                 }
             }
         }
