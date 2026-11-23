@@ -703,6 +703,7 @@ private enum Translations {
         "Ver las notas cayendo sobre un teclado": "Show the notes falling onto a keyboard",
         "Étnico": "Ethnic",
         "Órgano": "Organ",
+        "Volver a leer el MIDI": "Read the MIDI again",
     ]
 
     static let ca: [String: String] = [
@@ -1348,5 +1349,6 @@ private enum Translations {
         "Ver las notas cayendo sobre un teclado": "Mostra les notes caient sobre un teclat",
         "Étnico": "Ètnic",
         "Órgano": "Orgue",
+        "Volver a leer el MIDI": "Torna a llegir el MIDI",
     ]
 }

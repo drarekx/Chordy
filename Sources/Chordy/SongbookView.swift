@@ -110,6 +110,9 @@ struct SongbookView: View {
         .buttonStyle(.plain)
         .contextMenu {
             Button(tr("Editar…")) { editing = sheet.id }
+            if sheet.midi != nil, songbook.hasMidiFile(sheet.id) {
+                Button(tr("Volver a leer el MIDI")) { songbook.reread(sheet.id) }
+            }
             Button(tr("Borrar…"), role: .destructive) { deleting = sheet.id }
         }
     }
@@ -172,7 +175,7 @@ private struct SheetReader: View {
                 }
                 .onChange(of: songbook.position) { _, p in
                     guard parsed.chordLines.indices.contains(p) else { return }
-                    withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(parsed.chordLines[p], anchor: UnitPoint(x: 0, y: 0.35)) }
+                    withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(ChordSheetBody.scrollId(parsed.chordLines[p]), anchor: UnitPoint(x: 0, y: 0.35)) }
                 }
             }
             if let score = sheet.midi, showRoll {

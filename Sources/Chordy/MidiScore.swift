@@ -37,6 +37,19 @@ struct MidiScore: Codable, Equatable {
         var name: String
     }
 
+    /// Tempo from `beat` on.
+    struct Tempo: Codable, Equatable {
+        var beat: Double
+        var bpm: Double
+    }
+
+    /// Time signature from `beat` on: quarter notes per bar and how it's written.
+    struct Meter: Codable, Equatable {
+        var beat: Double
+        var barBeats: Double
+        var label: String
+    }
+
     var tracks: [Track]
     /// First tempo in the file.
     var bpm: Double
@@ -48,8 +61,38 @@ struct MidiScore: Codable, Equatable {
     var chords: [ChordAt]
     /// Key signature from the file («G», «Em»), if any.
     var key: String?
+    /// Every tempo and time signature change (nil in songs imported before they were read).
+    var tempos: [Tempo]?
+    var meters: [Meter]?
 
-    var bars: Int { max(1, Int((lengthBeats / barBeats).rounded(.up))) }
+    /// Where each bar starts (beats), following the time signature changes.
+    var barStarts: [Double] {
+        let meters = (self.meters?.isEmpty == false ? self.meters! : [Meter(beat: 0, barBeats: barBeats, label: timeSignature)])
+        var out: [Double] = []
+        var b = 0.0, m = 0
+        while b < lengthBeats - 1e-6 || out.isEmpty {
+            while m + 1 < meters.count, meters[m + 1].beat <= b + 1e-6 { m += 1 }
+            out.append(b)
+            var next = b + max(0.25, meters[m].barBeats)
+            // A new time signature starts a new bar.
+            if m + 1 < meters.count, meters[m + 1].beat < next - 1e-6, meters[m + 1].beat > b + 1e-6 { next = meters[m + 1].beat }
+            b = next
+            if out.count > 100_000 { break }
+        }
+        return out
+    }
+
+    var bars: Int { barStarts.count }
+
+    /// Bar (0-based) that `beat` falls in, given `barStarts`.
+    static func bar(at beat: Double, in starts: [Double]) -> Int {
+        var lo = 0, hi = starts.count - 1, found = 0
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if starts[mid] <= beat + 1e-6 { found = mid; lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return found
+    }
 
     /// Lowest and highest pitched (non-drum) note.
     var range: ClosedRange<Int> {
@@ -59,6 +102,7 @@ struct MidiScore: Codable, Equatable {
     }
 
     /// Index of the chord sounding at `beat` (−1 before the first).
+    /// (Chords are found per half bar; see `MidiChords`.)
     func chordIndex(at beat: Double) -> Int {
         var lo = 0, hi = chords.count - 1, found = -1
         while lo <= hi {
@@ -74,24 +118,41 @@ struct MidiScore: Codable, Equatable {
 enum MidiChords {
     private static let shapes: [(suffix: String, intervals: [Int], penalty: Double)] = [
         ("", [0, 4, 7], 0), ("m", [0, 3, 7], 0), ("7", [0, 4, 7, 10], 0.06), ("m7", [0, 3, 7, 10], 0.06),
-        ("maj7", [0, 4, 7, 11], 0.08), ("dim", [0, 3, 6], 0.12), ("sus4", [0, 5, 7], 0.12),
+        ("maj7", [0, 4, 7, 11], 0.08), ("6", [0, 4, 7, 9], 0.1), ("dim", [0, 3, 6], 0.12), ("sus4", [0, 5, 7], 0.12),
     ]
 
     /// The chords, half a bar at a time (a whole bar when both halves agree), repeats merged.
     static func detect(_ score: MidiScore) -> [(beat: Double, root: Int, suffix: String)] {
         let notes = score.tracks.filter { !$0.drums }.flatMap(\.notes)
         guard !notes.isEmpty else { return [] }
-        let step = score.barBeats >= 3 ? score.barBeats / 2 : score.barBeats
-        let windows = Int((score.lengthBeats / step).rounded(.up))
+        // Half bars (whole bars when they're short), following the time signature changes.
+        let starts = score.barStarts
+        var edges: [Double] = []
+        for (i, a) in starts.enumerated() {
+            let b = i + 1 < starts.count ? starts[i + 1] : score.lengthBeats
+            edges.append(a)
+            if b - a >= 3 { edges.append(a + (b - a) / 2) }
+        }
+        edges.append(score.lengthBeats)
+        let windows = edges.count - 1
+        guard windows > 0 else { return [] }
+        func window(at beat: Double) -> Int {
+            var lo = 0, hi = windows - 1, found = 0
+            while lo <= hi {
+                let mid = (lo + hi) / 2
+                if edges[mid] <= beat + 1e-6 { found = mid; lo = mid + 1 } else { hi = mid - 1 }
+            }
+            return found
+        }
         // Notes by window they touch, so each window only looks at its own.
-        var byWindow = [[MidiScore.Note]](repeating: [], count: max(1, windows))
+        var byWindow = [[MidiScore.Note]](repeating: [], count: windows)
         for n in notes {
-            let first = max(0, Int(n.start / step)), last = min(windows - 1, Int((n.start + n.length - 1e-6) / step))
+            let first = window(at: n.start), last = window(at: n.start + n.length - 1e-3)
             if first <= last { for w in first...last { byWindow[w].append(n) } }
         }
         var out: [(beat: Double, root: Int, suffix: String)] = []
         for w in 0..<windows {
-            let a = Double(w) * step, b = a + step
+            let a = edges[w], b = edges[w + 1]
             var weights = [Double](repeating: 0, count: 12)
             var bass: (pitch: Int, weight: Double)?
             for n in byWindow[w] {
@@ -162,19 +223,19 @@ enum MidiChords {
             var line = ""
             var bar = 0
             var i = 0
-            let bars = score.bars
+            let starts = score.barStarts
+            let bars = starts.count
             while bar < bars {
-                let b = Double(bar + 1) * score.barBeats
-                var cell = ""
+                let b = bar + 1 < bars ? starts[bar + 1] : score.lengthBeats + 1
+                var cell: [String] = []
                 while i < chords.count, chords[i].beat < b - 1e-6 {
-                    cell += "[\(chords[i].name)]   "
+                    cell.append("[\(chords[i].name)]")
                     i += 1
                 }
-                if cell.isEmpty { cell = "   %   " }
-                line += cell.padding(toLength: max(cell.count, 10), withPad: " ", startingAt: 0)
+                line += "| " + (cell.isEmpty ? "%" : cell.joined(separator: " ")) + " "
                 bar += 1
                 if bar % 4 == 0 || bar == bars {
-                    out.append(line.trimmingCharacters(in: .whitespaces))
+                    out.append(line + "|")
                     line = ""
                 }
             }
@@ -221,4 +282,48 @@ enum MidiChords {
         breakLine(blank: false)
         return lines
     }
+}
+
+// MARK: - Time
+
+/// Beats ↔ seconds through every tempo change of a song.
+struct TempoMap {
+    private var beats: [Double] = [0]
+    private var seconds: [Double] = [0]
+    private var bpms: [Double]
+
+    init(_ score: MidiScore) {
+        let tempos = (score.tempos ?? []).filter { $0.bpm > 0 }.sorted { $0.beat < $1.beat }
+        bpms = [tempos.first(where: { $0.beat <= 1e-6 })?.bpm ?? score.bpm]
+        for t in tempos where t.beat > 1e-6 {
+            let last = beats.count - 1
+            seconds.append(seconds[last] + (t.beat - beats[last]) * 60 / bpms[last])
+            beats.append(t.beat)
+            bpms.append(t.bpm)
+        }
+    }
+
+    private func segment(beat: Double) -> Int {
+        var lo = 0, hi = beats.count - 1, found = 0
+        while lo <= hi { let mid = (lo + hi) / 2; if beats[mid] <= beat { found = mid; lo = mid + 1 } else { hi = mid - 1 } }
+        return found
+    }
+
+    private func segment(seconds s: Double) -> Int {
+        var lo = 0, hi = seconds.count - 1, found = 0
+        while lo <= hi { let mid = (lo + hi) / 2; if seconds[mid] <= s { found = mid; lo = mid + 1 } else { hi = mid - 1 } }
+        return found
+    }
+
+    func seconds(at beat: Double) -> Double {
+        let i = segment(beat: beat)
+        return seconds[i] + (beat - beats[i]) * 60 / bpms[i]
+    }
+
+    func beat(atSeconds s: Double) -> Double {
+        let i = segment(seconds: s)
+        return beats[i] + (s - seconds[i]) * bpms[i] / 60
+    }
+
+    func bpm(at beat: Double) -> Double { bpms[segment(beat: beat)] }
 }

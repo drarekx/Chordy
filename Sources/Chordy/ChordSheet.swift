@@ -180,11 +180,14 @@ struct ChordName: Equatable, Hashable {
     /// Do these notes (pitch classes) sound like this chord? Root and third must be there,
     /// and most of what's held must belong to the chord (a melody note on top is fine;
     /// C–E–G is not an Em).
-    func isPlayed(by played: Set<Int>) -> Bool {
-        guard played.count >= 2, played.contains(root) else { return false }
-        if let third, !played.contains(third) { return false }
-        let inside = played.intersection(pitchClasses).count
-        return Double(inside) / Double(played.count) >= 0.74
+    func isPlayed(by played: Set<Int>) -> Bool { fit(played) >= 0.6 }
+
+    /// How well these notes match the chord, 0…1: 0 without root (or third), else the share
+    /// of what's held that belongs to the chord.
+    func fit(_ played: Set<Int>) -> Double {
+        guard played.count >= 2, played.contains(root) else { return 0 }
+        if let third, !played.contains(third) { return 0 }
+        return Double(played.intersection(pitchClasses).count) / Double(played.count)
     }
 }
 
@@ -282,6 +285,14 @@ struct ParsedSheet {
                 case "tempo": tempo = Int(value)
                 case "time": time = value
                 case "comment", "c", "comment_italic", "ci", "comment_box", "cb", "highlight":
+                    // «{c: }» empty: just a gap.
+                    if value.isEmpty {
+                        if current.lines.last.map({ $0.kind != .empty }) ?? false {
+                            current.lines.append(SheetLine(id: lineId, kind: .empty, segments: []))
+                            lineId += 1
+                        }
+                        continue
+                    }
                     current.lines.append(SheetLine(id: lineId, kind: .comment, segments: [], text: value))
                     lineId += 1
                 case "soc", "start_of_chorus", "sov", "start_of_verse", "sob", "start_of_bridge", "sot", "start_of_tab":
@@ -335,7 +346,9 @@ struct ParsedSheet {
                 }
             }
             if chord != nil || !text.isEmpty { segments.append(.init(chord: chord, text: text)) }
-            let onlyChords = segments.allSatisfy { $0.chord != nil || $0.text.trimmingCharacters(in: .whitespaces).isEmpty }
+            // Bar lines and repeat signs («| [C] | % |») aren't lyrics.
+            let onlyChords = (segments.contains { $0.chord != nil } || line.contains("|"))
+                && segments.allSatisfy { $0.text.trimmingCharacters(in: CharacterSet(charactersIn: " |%-/.:x()0123456789")).isEmpty }
             current.lines.append(SheetLine(id: lineId, kind: onlyChords ? .chords : .lyrics, segments: segments))
             lineId += 1
         }
@@ -399,11 +412,16 @@ struct ChordFollower {
     mutating func update(_ played: Set<Int>, chords: [ChordName], transpose: Int) -> Bool {
         defer { lastPlayed = played }
         guard played != lastPlayed, played.count >= 2 else { return false }
-        for step in 1...2 {
+        // What's held must fit the new chord better than the one playing now (C–E–G with a D
+        // on top is still C, not Em).
+        let now = chords.indices.contains(position) ? chords[position].transposed(transpose).fit(played) : 0
+        for step in 1...3 {
             let target = position + step
             guard chords.indices.contains(target) else { return false }
             let chord = chords[target].transposed(transpose)
-            guard chord.isPlayed(by: played) else { continue }
+            let fit = chord.fit(played)
+            guard fit >= 0.6, fit > now || chord.pitchClasses == chords[position < 0 ? target : position].transposed(transpose).pitchClasses
+            else { continue }
             // Same chord again (C → C): only on a new attack, not when a melody note joins.
             if chords.indices.contains(position), chords[position].transposed(transpose).pitchClasses == chord.pitchClasses,
                !lastPlayed.isEmpty { return false }

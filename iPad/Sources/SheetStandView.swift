@@ -95,10 +95,10 @@ struct SheetStandView: View {
                 }
                 .onChange(of: position) { _, p in
                     guard parsed.chordLines.indices.contains(p) else { return }
-                    withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(parsed.chordLines[p], anchor: UnitPoint(x: 0, y: 0.3)) }
+                    withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(ChordSheetBody.scrollId(parsed.chordLines[p]), anchor: UnitPoint(x: 0, y: 0.3)) }
                 }
                 .onChange(of: sheet.id) { _, _ in
-                    if let first = parsed.sections.first?.lines.first?.id { proxy.scrollTo(first, anchor: .top) }
+                    if let first = parsed.sections.first?.lines.first?.id { proxy.scrollTo(ChordSheetBody.scrollId(first), anchor: .top) }
                 }
             }
             }

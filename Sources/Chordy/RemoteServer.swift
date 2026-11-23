@@ -92,7 +92,12 @@ final class RemoteServer: ObservableObject {
         }.store(in: &cancellables)
         // A MIDI song: its notes when it opens, and the playhead.
         songbook.$openId.receive(on: RunLoop.main).sink { [weak self] _ in self?.sendScore(force: false) }.store(in: &cancellables)
-        songbook.player.objectWillChange.sink { [weak self] _ in self?.scheduleMidiClock() }.store(in: &cancellables)
+        // Only real changes (practice, mute, speed); the position moves on its own on the iPad.
+        let p = songbook.player
+        Publishers.MergeMany(p.$expected.map { _ in () }.eraseToAnyPublisher(), p.$muted.map { _ in () }.eraseToAnyPublisher(),
+                             p.$practiceTrack.map { _ in () }.eraseToAnyPublisher(), p.$speed.map { _ in () }.eraseToAnyPublisher())
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in self?.scheduleMidiClock() }.store(in: &cancellables)
         songbook.player.$playing.removeDuplicates().receive(on: RunLoop.main).sink { [weak self] playing in
             self?.midiPlaying(playing)
         }.store(in: &cancellables)

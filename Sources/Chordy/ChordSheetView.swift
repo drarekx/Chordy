@@ -18,6 +18,9 @@ struct SheetStyle {
 }
 
 struct ChordSheetBody: View {
+    /// Scroll target of a line («line-12»: plain numbers would also match sections).
+    static func scrollId(_ line: Int) -> String { "line-\(line)" }
+
     let parsed: ParsedSheet
     let transpose: Int
     /// Chord being played now, if following.
@@ -47,7 +50,7 @@ struct ChordSheetBody: View {
                     .padding(.bottom, 2)
             }
             ForEach(section.lines) { line in
-                lineView(line).id(line.id)
+                lineView(line).id(ChordSheetBody.scrollId(line.id))
             }
         }
         .padding(.leading, chorus ? style.fontSize * 0.8 : 0)
@@ -74,12 +77,32 @@ struct ChordSheetBody: View {
                 .font(.system(size: style.fontSize * 0.75, design: .monospaced))
                 .foregroundStyle(style.text2)
                 .lineLimit(1)
-        case .chords, .lyrics:
+        case .chords:
+            // Chords and bar lines in one row, wrapping between bars.
+            SheetFlow(spacing: style.fontSize * 0.35, lineSpacing: style.fontSize * 0.3) {
+                ForEach(Array(line.segments.enumerated()), id: \.offset) { _, segment in
+                    if let chord = segment.chord { chordLabel(chord, index: segment.index) }
+                    let rest = segment.text.trimmingCharacters(in: .whitespaces)
+                    if !rest.isEmpty {
+                        ForEach(Array(rest.split(separator: " ").enumerated()), id: \.offset) { _, mark in
+                            Text(String(mark)).font(chordFont).foregroundStyle(style.text3).fixedSize()
+                        }
+                    }
+                }
+            }
+        case .lyrics:
             let hasChords = line.segments.contains { $0.chord != nil }
             let hasText = line.segments.contains { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
-            SheetFlow(lineSpacing: style.fontSize * 0.2) {
+            ChordLineLayout(gap: style.fontSize * 0.3, lineSpacing: style.fontSize * 0.2, chordRow: hasChords, textRow: hasText) {
                 ForEach(Array(units(line).enumerated()), id: \.offset) { _, unit in
-                    unitView(unit, chordRow: hasChords, textRow: hasText)
+                    if let chord = unit.chord {
+                        chordLabel(chord, index: unit.index).layoutValue(key: SheetPartKey.self, value: .chord)
+                    }
+                    Text(unit.text.isEmpty ? " " : unit.text)
+                        .font(.system(size: style.fontSize))
+                        .foregroundStyle(style.text)
+                        .fixedSize()
+                        .layoutValue(key: SheetPartKey.self, value: .text)
                 }
             }
         }
@@ -110,23 +133,6 @@ struct ChordSheetBody: View {
         return out
     }
 
-    private func unitView(_ unit: Unit, chordRow: Bool, textRow: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if chordRow {
-                if let chord = unit.chord {
-                    chordLabel(chord, index: unit.index)
-                } else {
-                    Text(" ").font(chordFont).padding(.vertical, 2)
-                }
-            }
-            if textRow {
-                Text(unit.text.isEmpty ? " " : unit.text)
-                    .font(.system(size: style.fontSize))
-                    .foregroundStyle(style.text)
-            }
-        }
-    }
-
     private var chordFont: Font { .system(size: style.fontSize * 0.88, weight: .bold, design: .rounded) }
 
     @ViewBuilder
@@ -144,7 +150,7 @@ struct ChordSheetBody: View {
                 if isNext { RoundedRectangle(cornerRadius: 5).strokeBorder(style.current.opacity(0.7), lineWidth: 1.5) }
             }
             .padding(.leading, -4)
-            .padding(.trailing, style.fontSize * 0.35)
+            .fixedSize()
         if let index, let onTapChord {
             label.contentShape(Rectangle()).onTapGesture { onTapChord(index) }
         } else {
@@ -153,39 +159,100 @@ struct ChordSheetBody: View {
     }
 }
 
-/// Lays its children left to right and wraps to a new row when the width runs out.
-struct SheetFlow: Layout {
-    var lineSpacing: CGFloat = 4
+enum SheetPart { case chord, text }
+
+struct SheetPartKey: LayoutValueKey {
+    static let defaultValue = SheetPart.text
+}
+
+/// A line of lyrics with chords: words side by side as plain text, each chord above where its
+/// word starts. A chord only pushes the words apart when it would touch the chord before it
+/// («A[G]mazing» stays one word). Wraps between words when the width runs out.
+struct ChordLineLayout: Layout {
+    var gap: CGFloat
+    var lineSpacing: CGFloat
+    var chordRow: Bool
+    var textRow: Bool
+
+    private func frames(_ width: CGFloat, _ subviews: Subviews) -> (frames: [CGRect], size: CGSize) {
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        let parts = subviews.map { $0[SheetPartKey.self] }
+        let chordH = chordRow ? (zip(sizes, parts).filter { $0.1 == .chord }.map(\.0.height).max() ?? 0) : 0
+        let textH = textRow ? (zip(sizes, parts).filter { $0.1 == .text }.map(\.0.height).max() ?? 0) : 0
+        let rowH = chordH + textH
+        var frames = [CGRect](repeating: .zero, count: subviews.count)
+        var x: CGFloat = 0, y: CGFloat = 0, chordEnd = -CGFloat.infinity, widest: CGFloat = 0
+        var pendingChord: Int?
+        for i in subviews.indices {
+            if parts[i] == .chord { pendingChord = i; continue }
+            let tw = sizes[i].width
+            let cw = pendingChord.map { sizes[$0].width } ?? 0
+            var at = x
+            if pendingChord != nil { at = max(at, chordEnd + gap) }
+            if at > 0, at + max(tw, cw) > width {
+                y += rowH + lineSpacing
+                x = 0
+                at = 0
+                chordEnd = -.infinity
+            }
+            if let c = pendingChord {
+                frames[c] = CGRect(x: at, y: y, width: cw, height: sizes[c].height)
+                chordEnd = at + cw
+            }
+            frames[i] = CGRect(x: at, y: y + chordH, width: tw, height: textRow ? sizes[i].height : 0)
+            x = at + tw
+            widest = max(widest, x, chordEnd)
+            pendingChord = nil
+        }
+        return (frames, CGSize(width: widest, height: y + rowH))
+    }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let width = proposal.width ?? .infinity
-        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, widest: CGFloat = 0
-        for view in subviews {
-            let size = view.sizeThatFits(.unspecified)
-            if x > 0, x + size.width > width {
-                y += rowHeight + lineSpacing
-                x = 0
-                rowHeight = 0
-            }
-            x += size.width
-            widest = max(widest, x)
-            rowHeight = max(rowHeight, size.height)
-        }
-        return CGSize(width: proposal.width ?? widest, height: y + rowHeight)
+        let size = frames(proposal.width ?? .infinity, subviews).size
+        return CGSize(width: proposal.width ?? size.width, height: size.height)
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
+        let (frames, _) = self.frames(bounds.width, subviews)
+        for (i, view) in subviews.enumerated() {
+            let f = frames[i]
+            view.place(at: CGPoint(x: bounds.minX + f.minX, y: bounds.minY + f.minY), proposal: ProposedViewSize(f.size))
+        }
+    }
+}
+
+/// Children side by side with `spacing`, wrapping to a new row when the width runs out.
+struct SheetFlow: Layout {
+    var spacing: CGFloat
+    var lineSpacing: CGFloat
+
+    private func frames(_ width: CGFloat, _ subviews: Subviews) -> ([CGRect], CGSize) {
+        var x: CGFloat = 0, y: CGFloat = 0, rowH: CGFloat = 0, widest: CGFloat = 0
+        var out: [CGRect] = []
         for view in subviews {
             let size = view.sizeThatFits(.unspecified)
-            if x > bounds.minX, x + size.width > bounds.maxX {
-                y += rowHeight + lineSpacing
-                x = bounds.minX
-                rowHeight = 0
+            if x > 0, x + size.width > width {
+                y += rowH + lineSpacing
+                x = 0
+                rowH = 0
             }
-            view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
-            x += size.width
-            rowHeight = max(rowHeight, size.height)
+            out.append(CGRect(origin: CGPoint(x: x, y: y), size: size))
+            x += size.width + spacing
+            widest = max(widest, x - spacing)
+            rowH = max(rowH, size.height)
+        }
+        return (out, CGSize(width: widest, height: y + rowH))
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let size = frames(proposal.width ?? .infinity, subviews).1
+        return CGSize(width: proposal.width ?? size.width, height: size.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let (frames, _) = self.frames(bounds.width, subviews)
+        for (i, view) in subviews.enumerated() {
+            view.place(at: CGPoint(x: bounds.minX + frames[i].minX, y: bounds.minY + frames[i].minY), proposal: ProposedViewSize(frames[i].size))
         }
     }
 }

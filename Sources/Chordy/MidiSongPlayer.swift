@@ -37,12 +37,14 @@ final class MidiSongPlayer: ObservableObject {
     private let engine: ChordEngine
     private let instruments: InstrumentLibrary
     private var timer: Timer?
-    // Clock: beat(t) = fromBeat + (t − startTime) · bpm / 60.
+    // Clock: song seconds(t) = fromSeconds + (t − startTime) · speed, through the tempo map.
+    private var map: TempoMap?
     private var startTime = 0.0
-    private var fromBeat = 0.0
+    private var fromSeconds = 0.0
     private var scheduledTo = 0.0
     private var next: [Int] = []
-    private var pendingOffs: [(voice: Int, end: Double, track: Int)] = []
+    /// Notes started (or about to): voice, when it starts (host time), end beat, track.
+    private var pendingOffs: [(voice: Int, at: Double, end: Double, track: Int)] = []
     private var lastPublish = 0.0
     // Practice.
     private var groups: [(beat: Double, pitches: Set<Int>)] = []
@@ -50,7 +52,8 @@ final class MidiSongPlayer: ObservableObject {
     private var lastAttack: [Int: Double] = [:]
     private var lastHeld: Set<Int> = []
     private var passedAt = 0.0
-    private static let lookahead = 0.06
+    /// Playback isn't played live: a longer lookahead keeps it steady when the screen is busy.
+    private static let lookahead = 0.12
     private static let lead = 0.03
 
     init(engine: ChordEngine, instruments: InstrumentLibrary) {
@@ -58,7 +61,8 @@ final class MidiSongPlayer: ObservableObject {
         self.instruments = instruments
     }
 
-    var bpm: Double { (score?.bpm ?? 120) * speed }
+    /// Tempo now (with the speed applied).
+    var bpm: Double { (map?.bpm(at: beat) ?? score?.bpm ?? 120) * speed }
     var waiting: Bool { !expected.isEmpty }
 
     /// The open song (nil: none or not MIDI). Another song stops what's playing.
@@ -67,6 +71,7 @@ final class MidiSongPlayer: ObservableObject {
             stop()
             sheetId = id
             self.score = score
+            map = score.map(TempoMap.init)
             muted = []
             practiceTrack = nil
             beat = 0
@@ -80,8 +85,8 @@ final class MidiSongPlayer: ObservableObject {
 
     /// Position now, for drawing (between the published updates).
     func beatNow() -> Double {
-        guard playing, !waiting else { return beat }
-        return fromBeat + (CACurrentMediaTime() - startTime) * bpm / 60
+        guard playing, !waiting, let map else { return beat }
+        return map.beat(atSeconds: fromSeconds + (CACurrentMediaTime() - startTime) * speed)
     }
 
     func toggle() { playing ? stop() : play(from: beat >= (score?.lengthBeats ?? 0) ? 0 : beat) }
@@ -101,7 +106,7 @@ final class MidiSongPlayer: ObservableObject {
         timer?.invalidate()
         Synth.shared.start()
         preload()
-        fromBeat = b
+        fromSeconds = map?.seconds(at: b) ?? 0
         startTime = CACurrentMediaTime() + Self.lead
         scheduledTo = b
         beat = b
@@ -141,8 +146,11 @@ final class MidiSongPlayer: ObservableObject {
         for t in score.tracks { _ = instruments.player(for: route(t)) }
     }
 
+    /// Every note off now, or right after it starts if it's scheduled ahead (an off sent before
+    /// its on would leave it ringing).
     private func stopSounding() {
-        for off in pendingOffs { engine.output.noteOff(off.voice, pedal: false) }
+        let now = CACurrentMediaTime()
+        for off in pendingOffs { engine.output.noteOff(off.voice, pedal: false, at: max(now, off.at + 0.002)) }
         pendingOffs.removeAll()
     }
 
@@ -150,19 +158,27 @@ final class MidiSongPlayer: ObservableObject {
         let now = CACurrentMediaTime()
         pendingOffs.removeAll { off in
             guard muted.contains(off.track) || off.track == practiceTrack else { return false }
-            engine.output.noteOff(off.voice, pedal: false, at: now)
+            engine.output.noteOff(off.voice, pedal: false, at: max(now, off.at + 0.002))
             return true
         }
     }
 
     private func restartClock() {
+        // Notes already scheduled keep their times; the clock goes on from the last one.
+        let now = CACurrentMediaTime()
         let b = beatNow()
-        fromBeat = b
-        startTime = CACurrentMediaTime()
+        fromSeconds = map?.seconds(at: b) ?? 0
+        startTime = now
         scheduledTo = max(scheduledTo, b)
     }
 
-    private func time(of b: Double) -> Double { startTime + (b - fromBeat) * 60 / bpm }
+    private func time(of b: Double) -> Double {
+        startTime + ((map?.seconds(at: b) ?? 0) - fromSeconds) / speed
+    }
+
+    private func beat(at t: Double) -> Double {
+        map?.beat(atSeconds: fromSeconds + (t - startTime) * speed) ?? 0
+    }
 
     private func tick() {
         guard let score else { return stop() }
@@ -171,9 +187,9 @@ final class MidiSongPlayer: ObservableObject {
         if waiting {
             if practicePlayed() { pass(now) } else { return }
         }
-        let current = fromBeat + (now - startTime) * bpm / 60
+        let current = beat(at: now)
         if now - lastPublish > 1.0 / 30 {
-            beat = max(fromBeat, current)
+            beat = max(0, current)
             lastPublish = now
         }
         if current >= score.lengthBeats {
@@ -181,12 +197,12 @@ final class MidiSongPlayer: ObservableObject {
             beat = score.lengthBeats
             return
         }
-        var horizon = fromBeat + (now + Self.lookahead - startTime) * bpm / 60
+        var horizon = beat(at: now + Self.lookahead)
         // Practice: nothing past the next notes to play until they're played.
         if practiceTrack != nil, group < groups.count {
             let g = groups[group].beat
             if current >= g - 1e-3 {
-                fromBeat = g
+                fromSeconds = map?.seconds(at: g) ?? 0
                 startTime = now
                 beat = g
                 expected = groups[group].pitches
@@ -196,7 +212,7 @@ final class MidiSongPlayer: ObservableObject {
         }
         pendingOffs.removeAll { off in
             guard off.end <= horizon else { return false }
-            engine.output.noteOff(off.voice, pedal: false, at: time(of: off.end))
+            engine.output.noteOff(off.voice, pedal: false, at: max(time(of: off.end), off.at + 0.002))
             return true
         }
         guard horizon > scheduledTo else { return }
@@ -210,8 +226,9 @@ final class MidiSongPlayer: ObservableObject {
                 guard !silent, n.start >= scheduledTo - 1e-6 else { continue }
                 let pitch = n.pitch + shift
                 guard (0...127).contains(pitch) else { continue }
-                let voice = engine.output.noteOn(midi: pitch, velocity: n.velocity, instrument: inst, at: time(of: n.start))
-                pendingOffs.append((voice, n.start + max(0.05, n.length), track.id))
+                let at = time(of: n.start)
+                let voice = engine.output.noteOn(midi: pitch, velocity: n.velocity, instrument: inst, at: at)
+                pendingOffs.append((voice, at, n.start + max(0.05, n.length), track.id))
             }
         }
         scheduledTo = horizon

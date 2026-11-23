@@ -62,7 +62,6 @@ final class Songbook: ObservableObject {
             .store(in: &cancellables)
         // A MIDI song playing moves the highlighted chord by time.
         player.$beat.receive(on: RunLoop.main).sink { [weak self] _ in self?.followPlayer() }.store(in: &cancellables)
-        player.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
         loadPlayer()
     }
 
@@ -144,11 +143,11 @@ final class Songbook: ObservableObject {
 
     /// Adds a song from pasted text or a file's contents; returns its id.
     @discardableResult
-    func importText(_ text: String, title: String? = nil) -> String? {
+    func importText(_ text: String, title: String? = nil, artist: String? = nil) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let result = ChordSheetImport.chordPro(from: trimmed, fallbackTitle: title.flatMap { $0.isEmpty ? nil : $0 })
-        let sheet = ChordSheet(id: UUID().uuidString, title: result.title, artist: result.artist, source: result.source,
+        let sheet = ChordSheet(id: UUID().uuidString, title: result.title, artist: result.artist ?? artist, source: result.source,
                                addedAt: Date())
         sheets.append(sheet)
         sortSheets()
@@ -162,11 +161,10 @@ final class Songbook: ObservableObject {
     func importFiles(_ urls: [URL]) -> Int {
         var added = 0
         for url in urls where Self.fileTypes.contains(url.pathExtension.lowercased()) {
-            var name = url.deletingPathExtension().lastPathComponent
-                .replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ")
-            name = name.prefix(1).uppercased() + name.dropFirst()
+            let (name, artist) = Self.titleAndArtist(fromFile: url)
             if Self.midiTypes.contains(url.pathExtension.lowercased()) {
-                if let data = try? Data(contentsOf: url), data.count < 8_000_000, importMidi(data, title: name) != nil { added += 1 }
+                if let data = try? Data(contentsOf: url), data.count < 8_000_000,
+                   importMidi(data, title: name, artist: artist) != nil { added += 1 }
                 continue
             }
             guard let data = try? Data(contentsOf: url), data.count < 2_000_000 else { continue }
@@ -174,17 +172,58 @@ final class Songbook: ObservableObject {
                 ?? String(data: data, encoding: .windowsCP1252)
                 ?? String(data: data, encoding: .isoLatin1)
             guard let text else { continue }
-            if importText(text, title: name) != nil { added += 1 }
+            if importText(text, title: name, artist: artist) != nil { added += 1 }
         }
         return added
     }
 
+    /// «Queen - Bohemian Rhapsody.mid» → «Bohemian Rhapsody», «Queen»; «my_song.txt» → «My song».
+    static func titleAndArtist(fromFile url: URL) -> (String, String?) {
+        var name = url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "_", with: " ")
+        var artist: String?
+        for sep in [" - ", " – ", " — "] {
+            if let r = name.range(of: sep) {
+                let a = String(name[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+                let t = String(name[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                if !a.isEmpty, !t.isEmpty { artist = a; name = t }
+                break
+            }
+        }
+        name = name.replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        return (name.prefix(1).uppercased() + name.dropFirst(), artist)
+    }
+
+    /// Copies of the imported MIDI files, to read them again when the reader improves.
+    private static var midiFolder: URL {
+        let dir = fileURL.deletingLastPathComponent().appendingPathComponent("Songs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private static func midiFile(_ id: String) -> URL { midiFolder.appendingPathComponent("\(id).mid") }
+
+    func hasMidiFile(_ id: String) -> Bool { FileManager.default.fileExists(atPath: Self.midiFile(id).path) }
+
+    /// Reads the song's MIDI file again (notes, chords, lyrics); keeps title, artist and transposition.
+    func reread(_ id: String) {
+        guard let i = sheets.firstIndex(where: { $0.id == id }), let data = try? Data(contentsOf: Self.midiFile(id)),
+              let score = try? MidiFileReader.read(data) else { return }
+        sheets[i].midi = score
+        sheets[i].source = MidiChords.chordPro(score, title: sheets[i].title, artist: sheets[i].artist)
+        sheets[i].updatedAt = Date()
+        persist()
+        if id == openId { seek(-1); loadPlayer() }
+    }
+
     /// Adds a song from a MIDI file: its notes, and its chords (and lyrics) as the text.
     @discardableResult
-    func importMidi(_ data: Data, title: String) -> String? {
+    func importMidi(_ data: Data, title: String, artist: String? = nil) -> String? {
         guard let score = try? MidiFileReader.read(data) else { return nil }
-        let source = MidiChords.chordPro(score, title: title, artist: nil)
-        let sheet = ChordSheet(id: UUID().uuidString, title: title, artist: nil, source: source, addedAt: Date(), midi: score)
+        let source = MidiChords.chordPro(score, title: title, artist: artist)
+        let sheet = ChordSheet(id: UUID().uuidString, title: title, artist: artist, source: source, addedAt: Date(), midi: score)
+        try? data.write(to: Self.midiFile(sheet.id), options: .atomic)
         sheets.append(sheet)
         sortSheets()
         persist()
@@ -209,6 +248,8 @@ final class Songbook: ObservableObject {
 
     func remove(_ id: String) {
         sheets.removeAll { $0.id == id }
+        // Its MIDI copy goes to the Trash with it.
+        if hasMidiFile(id) { try? FileManager.default.trashItem(at: Self.midiFile(id), resultingItemURL: nil) }
         persist()
         if openId == id { open(sheets.first?.id) }
     }
