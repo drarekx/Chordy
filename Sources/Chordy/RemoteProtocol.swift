@@ -109,6 +109,8 @@ struct RemoteSheetRef: Codable, Equatable, Identifiable {
     var artist: String?
     /// Key as shown (transposed).
     var key: String?
+    /// Imported from a MIDI file (has notes to play and draw).
+    var midi: Bool?
 }
 
 /// The song open on the Mac: its ChordPro text (the iPad parses it with `ParsedSheet`).
@@ -120,6 +122,8 @@ struct RemoteSheet: Codable, Equatable {
     var transpose: Int
     var latin: Bool
     var following: Bool
+    /// Has notes (sent apart in `.midiScore`).
+    var midi: Bool?
 }
 
 struct RemoteState: Codable, Equatable {
@@ -174,6 +178,11 @@ enum RemoteMessage: Codable {
     case song(playing: Bool, beat: Double, bpm: Int)
     /// Chord being played in the open song (−1: before the first).
     case sheetPosition(id: String, index: Int)
+    /// The notes of the open MIDI song, once when it opens (and when an iPad connects).
+    case midiScore(id: String, score: MidiScore)
+    /// MIDI playback: where (beats) and how fast, on every change and ~4 times a second while it
+    /// plays (the iPad moves on its own in between). `expected`: practice notes waited for.
+    case midiClock(id: String, playing: Bool, beat: Double, bpm: Double, expected: [Int], muted: [Int], practice: Int?)
 }
 
 /// iPad → Mac.
@@ -242,6 +251,13 @@ enum RemoteCommand: Codable {
     /// Jump to a chord (−1: back to the start).
     case sheetSeek(index: Int)
     case sheetFollow(Bool)
+    case midiTogglePlay
+    case midiRewind
+    case midiSeek(beat: Double)
+    /// The track the player plays (the song waits for its notes), nil: none.
+    case midiPractice(track: Int?)
+    case midiMute(track: Int, muted: Bool)
+    case midiSpeed(Double)
 }
 
 /// Splits a TCP byte stream into JSON lines.

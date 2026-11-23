@@ -5,7 +5,10 @@ import SwiftUI
 struct SheetStandView: View {
     @ObservedObject var client: RemoteClient
     @ObservedObject var follow: SheetFollow
+    @ObservedObject var midi: MidiClock
     let state: RemoteState
+    /// MIDI songs: the lyrics with chords, or the falling notes.
+    @AppStorage("sheetShowNotes") private var showNotes = false
     @AppStorage("sheetFontSize") private var fontSize = 26.0
     @AppStorage("sheetListHidden") private var listHidden = false
     @StateObject private var cache = ParsedCache()
@@ -64,7 +67,24 @@ struct SheetStandView: View {
         let position = follow.id == sheet.id ? follow.index : -1
         return VStack(spacing: 0) {
             header(sheet, parsed, position: position)
+            if let score = midiScore(sheet) {
+                Rectangle().fill(Pal.line).frame(height: 1)
+                midiBar(score)
+            }
             Rectangle().fill(Pal.line).frame(height: 1)
+            if let score = midiScore(sheet), showNotes {
+                PianoRoll(score: score, transpose: sheet.transpose, playing: midi.playing,
+                          beat: { [midi] in MainActor.assumeIsolated { midi.beatNow() } },
+                          muted: midi.muted, practice: midi.practice, expected: midi.expected,
+                          held: { [client] in
+                              MainActor.assumeIsolated { client.live.notes.values.reduce(into: Set<Int>()) { $0.formUnion($1) } }
+                          },
+                          style: RollStyle(background: Pal.field, line: Pal.line, text: Pal.text3, whiteKey: Color(white: 0.93),
+                                           blackKey: Color(white: 0.12), held: Pal.accent, expected: Pal.warn, tracks: Pal.keyboards),
+                          window: 6)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .padding(10)
+            } else {
             ScrollViewReader { proxy in
                 ScrollView {
                     ChordSheetBody(parsed: parsed, transpose: sheet.transpose,
@@ -81,8 +101,59 @@ struct SheetStandView: View {
                     if let first = parsed.sections.first?.lines.first?.id { proxy.scrollTo(first, anchor: .top) }
                 }
             }
+            }
         }
         .background(Pal.card, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func midiScore(_ sheet: RemoteSheet) -> MidiScore? {
+        guard sheet.midi == true, midi.id == sheet.id else { return nil }
+        return midi.score
+    }
+
+    /// Play, back to the start, practice track, and letters or notes.
+    private func midiBar(_ score: MidiScore) -> some View {
+        let mine = midi.clockId == state.sheet?.id
+        let playing = mine && midi.playing
+        return HStack(spacing: 10) {
+            Button { client.send(.midiTogglePlay) } label: {
+                Image(systemName: playing ? "stop.fill" : "play.fill").font(.system(size: 18, weight: .bold))
+                    .frame(width: 56, height: 44)
+                    .foregroundStyle(playing ? Pal.onAccent : Pal.text)
+                    .background(playing ? Pal.accent : Pal.control, in: RoundedRectangle(cornerRadius: 11))
+            }
+            bigButton("backward.end.fill") { client.send(.midiRewind) }
+            Menu {
+                Button("Sin práctica") { client.send(.midiPractice(track: nil)) }
+                ForEach(score.tracks.filter { !$0.drums }) { t in
+                    Button(t.name.isEmpty ? "Pista \(t.id + 1)" : t.name) { client.send(.midiPractice(track: t.id)) }
+                }
+            } label: {
+                Label(practiceTitle(score), systemImage: "hand.raised.fingers.spread")
+                    .font(.system(size: 14, weight: .semibold))
+                    .padding(.horizontal, 12).frame(height: 44)
+                    .background(midi.practice != nil ? Pal.accentSoft : Pal.control, in: RoundedRectangle(cornerRadius: 11))
+            }
+            if mine, !midi.expected.isEmpty {
+                Text("Toca: " + midi.expected.sorted().map { ChordName.noteName($0 % 12, flat: false, latin: false) + "\($0 / 12 - 1)" }.joined(separator: " "))
+                    .font(.system(size: 15, weight: .bold)).foregroundStyle(Pal.warn)
+            }
+            Spacer()
+            Picker("", selection: $showNotes) {
+                Text("Letra").tag(false)
+                Text("Notas").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 180)
+        }
+        .foregroundStyle(Pal.text)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    private func practiceTitle(_ score: MidiScore) -> String {
+        guard let p = midi.practice, let t = score.tracks.first(where: { $0.id == p }) else { return "Práctica" }
+        return "Práctica: " + (t.name.isEmpty ? "Pista \(t.id + 1)" : t.name)
     }
 
     private var style: SheetStyle {

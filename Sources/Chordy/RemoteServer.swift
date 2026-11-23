@@ -21,6 +21,10 @@ final class RemoteServer: ObservableObject {
     private let song: Song
     private let songbook: Songbook
     private var songTimer: Timer?
+    private var midiTimer: Timer?
+    private var midiClockScheduled = false
+    /// MIDI song whose notes were last sent.
+    private var sentScore: String?
     /// Notes the iPad's try-out keyboard holds: MIDI note → voice.
     private var tryVoices: [Int: Int] = [:]
     private var lastNotes: [String: Set<Int>] = [:]
@@ -85,6 +89,12 @@ final class RemoteServer: ObservableObject {
         // The chord being played in the open song (and a jump when another song opens).
         songbook.$position.combineLatest(songbook.$openId).receive(on: RunLoop.main).sink { [weak self] _ in
             self?.sendSheetPosition()
+        }.store(in: &cancellables)
+        // A MIDI song: its notes when it opens, and the playhead.
+        songbook.$openId.receive(on: RunLoop.main).sink { [weak self] _ in self?.sendScore(force: false) }.store(in: &cancellables)
+        songbook.player.objectWillChange.sink { [weak self] _ in self?.scheduleMidiClock() }.store(in: &cancellables)
+        songbook.player.$playing.removeDuplicates().receive(on: RunLoop.main).sink { [weak self] playing in
+            self?.midiPlaying(playing)
         }.store(in: &cancellables)
         // The song's playhead: often while it plays, once when it stops or jumps.
         song.$playing.removeDuplicates().sink { [weak self] playing in
@@ -201,7 +211,7 @@ final class RemoteServer: ObservableObject {
         lastState = state
         broadcast(.state(state))
         sendTick()
-        if force { sendBeat(BeatClock.shared.beat); sendSong(); sendSheetPosition() }
+        if force { sendBeat(BeatClock.shared.beat); sendSong(); sendSheetPosition(); sendScore(force: true); sendMidiClock() }
     }
 
     private func sendBeat(_ beat: Int?) {
@@ -239,6 +249,43 @@ final class RemoteServer: ObservableObject {
         if before != after, !asNew {
             for c in keyboards.configs where c.instrument == before { keyboards.update(c.id) { $0.instrument = after } }
         }
+    }
+
+    private func sendScore(force: Bool) {
+        guard !connections.isEmpty, let sheet = songbook.open, let score = sheet.midi else { return }
+        guard force || sentScore != sheet.id else { return }
+        sentScore = sheet.id
+        broadcast(.midiScore(id: sheet.id, score: score))
+        sendMidiClock()
+    }
+
+    private func scheduleMidiClock() {
+        guard !midiClockScheduled, !connections.isEmpty else { return }
+        midiClockScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.midiClockScheduled = false
+            self?.sendMidiClock()
+        }
+    }
+
+    private func midiPlaying(_ playing: Bool) {
+        midiTimer?.invalidate()
+        midiTimer = nil
+        if playing {
+            let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.sendMidiClock() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            midiTimer = timer
+        }
+        sendMidiClock()
+    }
+
+    private func sendMidiClock() {
+        let p = songbook.player
+        guard !connections.isEmpty, let id = p.sheetId, p.score != nil else { return }
+        broadcast(.midiClock(id: id, playing: p.playing, beat: p.beatNow(), bpm: p.bpm, expected: p.expected.sorted(),
+                             muted: p.muted.sorted(), practice: p.practiceTrack))
     }
 
     private func sendSheetPosition() {
@@ -313,11 +360,12 @@ final class RemoteServer: ObservableObject {
                                selectedId: sounds.selectedId, draft: sounds.draft, dirty: sounds.dirty,
                                audition: keyboards.auditionId),
             sheets: songbook.sheets.map {
-                RemoteSheetRef(id: $0.id, title: $0.title, artist: $0.artist, key: songbook.shownKey($0))
+                RemoteSheetRef(id: $0.id, title: $0.title, artist: $0.artist, key: songbook.shownKey($0), midi: $0.midi != nil)
             },
             sheet: songbook.open.map {
                 RemoteSheet(id: $0.id, title: $0.title, artist: $0.artist, source: $0.source, transpose: $0.transpose,
-                            latin: songbook.latin, following: songbook.following)
+                            latin: songbook.latin, following: songbook.following,
+                            midi: $0.midi != nil)
             })
     }
 
@@ -411,10 +459,19 @@ final class RemoteServer: ObservableObject {
         case .sheetTranspose(let id, let semitones): songbook.setTranspose(id, max(-11, min(11, semitones)))
         case .sheetSeek(let index): songbook.seek(index)
         case .sheetFollow(let on): songbook.following = on
+        case .midiTogglePlay: songbook.player.toggle()
+        case .midiRewind: songbook.player.rewind()
+        case .midiSeek(let beat): if beat.isFinite { songbook.player.seek(beat) }
+        case .midiPractice(let track):
+            songbook.player.practiceTrack = track.flatMap { t in songbook.player.score?.tracks.contains { $0.id == t } == true ? t : nil }
+        case .midiMute(let track, let muted):
+            if muted { songbook.player.muted.insert(track) } else { songbook.player.muted.remove(track) }
+        case .midiSpeed(let speed): if speed.isFinite { songbook.player.speed = max(0.25, min(2, speed)) }
         case .stopAll:
             for voice in tryVoices.values { engine.output.noteOff(voice, pedal: false) }
             tryVoices.removeAll()
             song.stop()
+            songbook.player.stop()
             loops.stopPlayback()
             drums.stop()
             engine.stopAll()

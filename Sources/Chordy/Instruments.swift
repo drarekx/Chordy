@@ -117,7 +117,21 @@ struct Instrument: Identifiable, Hashable {
         gm("kit:brush", tr("Batería escobillas"), .drums, 40, drums: true),
     ]
 
-    static func with(_ id: String) -> Instrument? { all.first { $0.id == id } }
+    static func with(_ id: String) -> Instrument? { all.first { $0.id == id } ?? generalMidi(id) }
+
+    /// Any General MIDI program, for MIDI files: «gm:<pack>:<program>» or «gm:<pack>:kit<kit>».
+    static func generalMidi(program: Int, drums: Bool, pack: InstrumentPack) -> String {
+        "gm:\(pack.id):\(drums ? "kit" : "")\(max(0, min(127, program)))"
+    }
+
+    private static func generalMidi(_ id: String) -> Instrument? {
+        let parts = id.split(separator: ":")
+        guard parts.count == 3, parts[0] == "gm", InstrumentPack.with(String(parts[1])) != nil else { return nil }
+        let drums = parts[2].hasPrefix("kit")
+        guard let program = Int(drums ? parts[2].dropFirst(3) : parts[2]), (0...127).contains(program) else { return nil }
+        return Instrument(id: id, name: "GM \(program + 1)", group: drums ? .drums : .keys, pack: String(parts[1]),
+                          program: UInt8(program), bankMSB: drums ? 120 : 121)
+    }
 }
 
 // MARK: - Library (selection and downloads)

@@ -328,6 +328,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if let i = Int(command.dropFirst(10)), book.sheets.indices.contains(i) { book.open(book.sheets[i].id) }
                 case let command? where command.hasPrefix("sheetseek:"):
                     if let i = Int(command.dropFirst(10)) { AppModel.shared.songbook.seek(i) }
+                case "midiplay": AppModel.shared.songbook.player.toggle()
+                case let command? where command.hasPrefix("midipractice:"):
+                    // midipractice:<track|none>; mididump:<file> writes the player's state.
+                    AppModel.shared.songbook.player.practiceTrack = Int(command.dropFirst(13))
+                case let command? where command.hasPrefix("mididump:"):
+                    let p = AppModel.shared.songbook.player
+                    let line = "playing=\(p.playing) beat=\(String(format: "%.2f", p.beatNow())) bpm=\(p.bpm) expected=\(p.expected.sorted()) "
+                        + "position=\(AppModel.shared.songbook.position) tracks=\(p.score?.tracks.map { p.route($0) } ?? [])"
+                    try? line.write(toFile: String(command.dropFirst(9)), atomically: true, encoding: .utf8)
                 case let command? where command.hasPrefix("sheetloop:"):
                     // sheetloop:<file> makes a loop from the open song and writes its events.
                     let loops = AppModel.shared.loops

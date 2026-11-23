@@ -34,6 +34,8 @@ final class RemoteClient: ObservableObject {
     let song = SongClock()
     /// Chord being played in the open song; its own object so only the music stand redraws.
     let sheet = SheetFollow()
+    /// The open MIDI song: notes and playhead; its own object so only the piano roll redraws.
+    let midi = MidiClock()
 
     private var browser: NWBrowser?
     private var results: [String: NWEndpoint] = [:]
@@ -204,6 +206,18 @@ final class RemoteClient: ObservableObject {
             song.playing = playing
             song.beat = beat
             song.bpm = bpm
+        case .midiScore(let id, let score):
+            midi.id = id
+            midi.score = score
+        case .midiClock(let id, let playing, let beat, let bpm, let expected, let muted, let practice):
+            midi.clockId = id
+            midi.playing = playing
+            midi.beat = beat
+            midi.bpm = bpm
+            midi.receivedAt = CACurrentMediaTime()
+            midi.expected = Set(expected)
+            midi.muted = Set(muted)
+            midi.practice = practice
         case .sheetPosition(let id, let index):
             sheet.id = id
             sheet.index = index
@@ -237,6 +251,26 @@ final class RemoteClient: ObservableObject {
 @MainActor
 final class LiveKeys: ObservableObject {
     @Published var notes: [String: Set<Int>] = [:]
+}
+
+/// The Mac's MIDI song: its notes and where it plays (moving on its own between messages).
+@MainActor
+final class MidiClock: ObservableObject {
+    @Published var id: String?
+    @Published var score: MidiScore?
+    @Published var clockId: String?
+    @Published var playing = false
+    @Published var beat = 0.0
+    @Published var bpm = 120.0
+    @Published var expected: Set<Int> = []
+    @Published var muted: Set<Int> = []
+    @Published var practice: Int?
+    var receivedAt = 0.0
+
+    func beatNow() -> Double {
+        guard playing, expected.isEmpty else { return beat }
+        return beat + (CACurrentMediaTime() - receivedAt) * bpm / 60
+    }
 }
 
 /// Chord being played in the Mac's open song (−1: before the first).

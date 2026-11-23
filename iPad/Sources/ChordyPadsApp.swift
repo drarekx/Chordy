@@ -77,7 +77,7 @@ struct RootView: View {
                     case .keys: KeysView(client: client, state: state)
                     case .synth: SynthView(client: client, state: state)
                     case .mix: MixView(client: client, state: state)
-                    case .sheet: SheetStandView(client: client, follow: client.sheet, state: state)
+                    case .sheet: SheetStandView(client: client, follow: client.sheet, midi: client.midi, state: state)
                     }
                 }
                 .padding(16)

@@ -201,6 +201,8 @@ struct ChordSheet: Codable, Equatable, Identifiable {
     var transpose = 0
     var addedAt: Date
     var updatedAt: Date?
+    /// Imported from a MIDI file: its notes (the text is the chords found in them).
+    var midi: MidiScore?
 
     /// Key written in the song («G», «Am»), else guessed from its chords.
     var key: String? { parsed.key }

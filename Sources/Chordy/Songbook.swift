@@ -22,13 +22,17 @@ final class Songbook: ObservableObject {
     }
 
     private let engine: ChordEngine
+    /// Plays the open song when it came from a MIDI file.
+    let player: MidiSongPlayer
     /// Key shown for each song, by id (parsing every song on each redraw adds up).
     private var keys: [String: (source: String, transpose: Int, key: String?)] = [:]
     private var follower = ChordFollower()
     private var cancellables = Set<AnyCancellable>()
     private var cache: (id: String, source: String, parsed: ParsedSheet)?
 
-    static let fileTypes = ["txt", "cho", "chordpro", "chopro", "crd", "pro", "text"]
+    static let textTypes = ["txt", "cho", "chordpro", "chopro", "crd", "pro", "text"]
+    static let midiTypes = ["mid", "midi", "kar", "smf"]
+    static var fileTypes: [String] { textTypes + midiTypes }
 
     private static var fileURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -37,8 +41,9 @@ final class Songbook: ObservableObject {
         return dir.appendingPathComponent("songbook.json")
     }
 
-    init(engine: ChordEngine) {
+    init(engine: ChordEngine, instruments: InstrumentLibrary) {
         self.engine = engine
+        player = MidiSongPlayer(engine: engine, instruments: instruments)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         if let data = try? Data(contentsOf: Self.fileURL), let list = try? decoder.decode([ChordSheet].self, from: data) {
@@ -55,6 +60,24 @@ final class Songbook: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.played() }
             .store(in: &cancellables)
+        // A MIDI song playing moves the highlighted chord by time.
+        player.$beat.receive(on: RunLoop.main).sink { [weak self] _ in self?.followPlayer() }.store(in: &cancellables)
+        player.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
+        loadPlayer()
+    }
+
+    private func loadPlayer() {
+        player.load(open?.id, score: open?.midi, transpose: open?.transpose ?? 0)
+    }
+
+    private func followPlayer() {
+        guard player.playing || player.beat > 0, let sheet = open, let score = sheet.midi, player.sheetId == sheet.id,
+              let parsed = openParsed, parsed.chords.count == score.chords.count else { return }
+        let i = score.chordIndex(at: player.beat)
+        if i != position {
+            follower.seek(i)
+            position = i
+        }
     }
 
     // MARK: Open song
@@ -83,6 +106,7 @@ final class Songbook: ObservableObject {
         openId = id
         UserDefaults.standard.set(id, forKey: "songbookOpen")
         seek(-1)
+        loadPlayer()
     }
 
     func seek(_ index: Int) {
@@ -102,10 +126,12 @@ final class Songbook: ObservableObject {
         while t < -6 { t += 12 }
         sheets[i].transpose = t
         persist()
+        if id == openId { loadPlayer() }
     }
 
     private func played() {
-        guard following, let sheet = open, let parsed = openParsed else { return }
+        // A playing MIDI song moves by time, not by what's played.
+        guard following, !player.playing, let sheet = open, let parsed = openParsed else { return }
         var pcs = Set<Int>()
         for chord in engine.sounding where chord.source == .user { for n in chord.notes { pcs.insert(n % 12) } }
         for note in engine.heldNotes.values { pcs.insert(note.midi % 12) }
@@ -136,16 +162,34 @@ final class Songbook: ObservableObject {
     func importFiles(_ urls: [URL]) -> Int {
         var added = 0
         for url in urls where Self.fileTypes.contains(url.pathExtension.lowercased()) {
+            var name = url.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ")
+            name = name.prefix(1).uppercased() + name.dropFirst()
+            if Self.midiTypes.contains(url.pathExtension.lowercased()) {
+                if let data = try? Data(contentsOf: url), data.count < 8_000_000, importMidi(data, title: name) != nil { added += 1 }
+                continue
+            }
             guard let data = try? Data(contentsOf: url), data.count < 2_000_000 else { continue }
             let text = String(data: data, encoding: .utf8)
                 ?? String(data: data, encoding: .windowsCP1252)
                 ?? String(data: data, encoding: .isoLatin1)
             guard let text else { continue }
-            let name = url.deletingPathExtension().lastPathComponent
-                .replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ")
             if importText(text, title: name) != nil { added += 1 }
         }
         return added
+    }
+
+    /// Adds a song from a MIDI file: its notes, and its chords (and lyrics) as the text.
+    @discardableResult
+    func importMidi(_ data: Data, title: String) -> String? {
+        guard let score = try? MidiFileReader.read(data) else { return nil }
+        let source = MidiChords.chordPro(score, title: title, artist: nil)
+        let sheet = ChordSheet(id: UUID().uuidString, title: title, artist: nil, source: source, addedAt: Date(), midi: score)
+        sheets.append(sheet)
+        sortSheets()
+        persist()
+        open(sheet.id)
+        return sheet.id
     }
 
     func update(_ id: String, title: String, artist: String, source: String) {
@@ -205,19 +249,52 @@ final class Songbook: ObservableObject {
         guard let sheet = open, let parsed = openParsed, !parsed.chords.isEmpty else { return nil }
         let (tonic, flavor) = key(of: sheet, parsed) ?? (Note.at(parsed.chords[0].root + sheet.transpose), .major)
         let beats = LoopMath.beatsPerBar
+        // From a MIDI file the chords keep their place in time; otherwise one bar each.
+        let timed = sheet.midi.flatMap { $0.chords.count == parsed.chords.count ? $0 : nil }
+        let total = timed.map { ($0.lengthBeats / beats).rounded(.up) * beats } ?? Double(parsed.chords.count) * beats
         let events = parsed.chords.enumerated().map { i, chord -> LoopEvent in
             let c = chord.transposed(sheet.transpose)
             let (degree, accidental) = Music.root(ofPitchClass: c.root, tonic, flavor)
+            let start = timed.map { $0.chords[i].beat } ?? Double(i) * beats
+            let end = timed.map { i + 1 < $0.chords.count ? $0.chords[i + 1].beat : total } ?? start + beats
             return LoopEvent(degree: degree, color: Self.color(c.quality), accidental: accidental,
-                             start: Double(i) * beats, length: beats)
+                             start: start, length: max(0.25, end - start))
         }
-        var loop = loops.createEmpty(bars: parsed.chords.count)
+        var loop = loops.createEmpty(bars: Int(total / beats))
         loop.name = sheet.title
         loop.tonic = tonic
         loop.flavor = flavor
         loop.events = events
         loops.save(loop)
         return loop.id
+    }
+
+    /// A loop with one track of the open MIDI song (its notes, its instrument). Returns the loop id.
+    func makeLoop(track id: Int, into loops: Loops) -> String? {
+        guard let sheet = open, let score = sheet.midi, let track = score.tracks.first(where: { $0.id == id }),
+              !track.notes.isEmpty else { return nil }
+        let shift = track.drums ? 0 : sheet.transpose
+        let events = track.notes.compactMap { n -> LoopEvent? in
+            let pitch = n.pitch + shift
+            guard (0...127).contains(pitch) else { return nil }
+            var e = LoopEvent(degree: 1, color: .diatonic, start: n.start, length: n.length)
+            e.midi = pitch
+            e.velocity = n.velocity
+            return e
+        }
+        let bars = max(1, Int((score.lengthBeats / LoopMath.beatsPerBar).rounded(.up)))
+        var loop = loops.createEmpty(bars: bars)
+        loop.name = "\(sheet.title) · \(trackName(track))"
+        loop.bpm = Int(score.bpm.rounded())
+        loop.events = events
+        loop.instrument = SoundRoute.parse(player.route(track)).instrument
+        loops.save(loop)
+        return loop.id
+    }
+
+    func trackName(_ track: MidiScore.Track) -> String {
+        if !track.name.isEmpty { return track.name }
+        return track.drums ? tr("Batería") : tr("Pista %d", track.id + 1)
     }
 
     /// The nearest of Chordy's chord colors.

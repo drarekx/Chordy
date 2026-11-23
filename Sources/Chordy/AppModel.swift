@@ -43,7 +43,7 @@ final class AppModel: ObservableObject {
         midi.watch(loops.objectWillChange)
         midi.watch(drums.objectWillChange)
         song = Song(engine: engine, loops: loops, drums: drums, instruments: instruments)
-        songbook = Songbook(engine: engine)
+        songbook = Songbook(engine: engine, instruments: instruments)
         remote = RemoteServer(drums: drums, engine: engine, keyboards: keyboards, loops: loops,
                               midi: midi, sounds: sounds, instruments: instruments, song: song,
                               songbook: songbook)

@@ -57,7 +57,7 @@ struct SongbookView: View {
                 SectionLabel(tr("Canciones"))
                 Spacer()
                 IconButton(symbol: "doc.on.clipboard", label: tr("Pegar el texto de una canción")) { pasting = true }
-                IconButton(symbol: "square.and.arrow.down", label: tr("Importar archivos (.txt, .cho)…")) { importFiles() }
+                IconButton(symbol: "square.and.arrow.down", label: tr("Importar archivos (.txt, .cho, .mid)…")) { importFiles() }
             }
             AppTextField(placeholder: tr("Buscar"), text: $search, icon: "magnifyingglass")
             ScrollView {
@@ -65,7 +65,7 @@ struct SongbookView: View {
                     ForEach(filtered) { sheet in row(sheet) }
                 }
             }
-            Text(tr("Arrastra aquí archivos .txt o .cho, o pega el texto copiado de una web."))
+            Text(tr("Arrastra aquí archivos .txt, .cho o .mid, o pega el texto copiado de una web."))
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.text3)
                 .fixedSize(horizontal: false, vertical: true)
@@ -118,7 +118,7 @@ struct SongbookView: View {
         VStack(spacing: 14) {
             Image(systemName: "music.note.list").font(.system(size: 40)).foregroundStyle(Theme.text3)
             Text(tr("Aún no hay canciones")).font(.system(size: 17, weight: .semibold)).foregroundStyle(Theme.text)
-            Text(tr("Copia una canción con acordes de cualquier web y pégala, o importa archivos .txt o ChordPro (.cho)."))
+            Text(tr("Copia una canción con acordes de cualquier web y pégala, o importa archivos .txt, ChordPro (.cho) o MIDI (.mid, .kar)."))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(Theme.text2)
                 .frame(maxWidth: 380)
@@ -150,16 +150,21 @@ private struct SheetReader: View {
     let loops: Loops
     let edit: () -> Void
     @AppStorage("sheetFontSize") private var fontSize = 18.0
+    @AppStorage("midiShowRoll") private var showRoll = true
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Rectangle().fill(Theme.line).frame(height: 1)
+            if let score = sheet.midi {
+                MidiSongBar(player: songbook.player, songbook: songbook, score: score, loops: loops, showRoll: $showRoll)
+                Rectangle().fill(Theme.line).frame(height: 1)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     ChordSheetBody(parsed: parsed, transpose: sheet.transpose,
                                    position: songbook.following ? songbook.position : nil,
-                                   style: style, latin: songbook.latin ? true : nil) { songbook.seek($0) }
+                                   style: style, latin: songbook.latin ? true : nil) { tapped($0) }
                         .padding(.horizontal, 32)
                         .padding(.vertical, 24)
                         .frame(maxWidth: 900, alignment: .leading)
@@ -170,6 +175,19 @@ private struct SheetReader: View {
                     withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(parsed.chordLines[p], anchor: UnitPoint(x: 0, y: 0.35)) }
                 }
             }
+            if let score = sheet.midi, showRoll {
+                Rectangle().fill(Theme.line).frame(height: 1)
+                MidiRollPanel(player: songbook.player, score: score, transpose: sheet.transpose, engine: AppModel.shared.engine)
+                    .frame(height: 300)
+            }
+        }
+    }
+
+    /// A chord clicked: follow from there (and in a MIDI song, play from there).
+    private func tapped(_ index: Int) {
+        songbook.seek(index)
+        if let score = sheet.midi, score.chords.count == parsed.chords.count, score.chords.indices.contains(index) {
+            songbook.player.seek(score.chords[index].beat)
         }
     }
 

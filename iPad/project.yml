@@ -21,6 +21,8 @@ targets:
       - path: ../Sources/Chordy/Patch.swift
       - path: ../Sources/Chordy/ChordSheet.swift
       - path: ../Sources/Chordy/ChordSheetView.swift
+      - path: ../Sources/Chordy/MidiScore.swift
+      - path: ../Sources/Chordy/PianoRollView.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.egluu.chordypads
