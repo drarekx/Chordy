@@ -627,7 +627,7 @@ final class DrumMachine: ObservableObject {
             }
             DispatchQueue.main.async {
                 guard generation == self.kitGeneration else { return }
-                Synth.shared.attach(sampler)
+                Synth.shared.attach(sampler, to: Synth.shared.drumBus)
                 self.attached = true
                 sampler.overallGain = SamplerPlayer.headroomDB
                 sampler.volume = Float(self.pattern.volume)

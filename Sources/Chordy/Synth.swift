@@ -21,6 +21,23 @@ final class Synth: @unchecked Sendable {
     private var compressor: AVAudioUnitEffect!
     /// Every synth output (dry and each effects bus) meets here before the compressor.
     private let synthMixer = AVAudioMixerNode()
+    /// The synth after its compressor: to the mix and to the shared room.
+    private let synthOut = AVAudioMixerNode()
+    /// The shared room: every source sends a little here (one reverb for everything, instead of
+    /// each sound dry or with its own hall that crossfades its dry signal away).
+    private let roomSend = AVAudioMixerNode()
+    private let room = AVAudioUnitReverb()
+    /// High-pass on the room's return, so the low end stays clean.
+    private let roomEQ = AVAudioUnitEQ(numberOfBands: 1)
+    /// Every sampler (instruments, MIDI files) and the drum kit meet here, then go to the mix
+    /// and the room. A mixer whose output is split to two places stays uninitialized (silent,
+    /// "pending connections") unless it already has an input when the engine starts: each
+    /// gets a silent source at bus 0 so samplers can join later.
+    let samplerBus = AVAudioMixerNode()
+    let drumBus = AVAudioMixerNode()
+    /// How much of each kind of source goes to the room by default.
+    static let roomSendLevel: Float = 0.16
+    static let drumRoomSendLevel: Float = 0.08
     private var format: AVAudioFormat?
 
     /// Outputs: slot 0 is dry; each effects bus ("kb:<id>", "loop:<id>") gets its own slot with
@@ -111,7 +128,32 @@ final class Synth: @unchecked Sendable {
         engine.attach(synthMixer)
         engine.connect(source, to: synthMixer, format: format)
         engine.connect(synthMixer, to: compressor, format: format)
-        engine.connect(compressor, to: engine.mainMixerNode, format: format)
+        // The room: send mixer → reverb (all wet) → high-pass → mix.
+        for node in [roomSend, room, roomEQ] as [AVAudioNode] { engine.attach(node) }
+        room.loadFactoryPreset(.mediumRoom)
+        room.wetDryMix = 100
+        let band = roomEQ.bands[0]
+        band.filterType = .highPass
+        band.frequency = 250
+        band.bypass = false
+        engine.connect(roomSend, to: room, format: format)
+        engine.connect(room, to: roomEQ, format: format)
+        engine.connect(roomEQ, to: engine.mainMixerNode, format: format)
+        engine.attach(synthOut)
+        engine.connect(compressor, to: synthOut, format: format)
+        connectOutput(synthOut, send: Self.roomSendLevel, format: format)
+        for bus in [samplerBus, drumBus] {
+            engine.attach(bus)
+            let silence = AVAudioSourceNode(format: format) { silent, _, frames, buffers in
+                for b in UnsafeMutableAudioBufferListPointer(buffers) { memset(b.mData, 0, Int(b.mDataByteSize)) }
+                silent.pointee = true
+                return noErr
+            }
+            engine.attach(silence)
+            engine.connect(silence, to: bus, fromBus: 0, toBus: 0, format: format)
+        }
+        connectOutput(samplerBus, send: Self.roomSendLevel, format: format)
+        connectOutput(drumBus, send: Self.drumRoomSendLevel, format: format)
         // Master limiter: synth + samplers + drums together must never pass 0 dBFS (a full
         // kit hit alone reached +0.9 dB and distorted).
         let master = Self.limiter()
@@ -181,17 +223,59 @@ final class Synth: @unchecked Sendable {
         return id
     }
 
+    /// Listens to the main mix (before the master limiter) for `seconds` and reports the peak
+    /// and RMS in dBFS, to compare levels without listening.
+    func debugMeter(seconds: Double, done: @escaping (String) -> Void) {
+        start()
+        let mixer = engine.mainMixerNode
+        let box = OSAllocatedUnfairLock(initialState: (peak: Float(0), sum: Double(0), count: 0))
+        mixer.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in
+            guard let data = buffer.floatChannelData else { return }
+            var peak: Float = 0, sum = 0.0
+            for c in 0..<Int(buffer.format.channelCount) {
+                for i in 0..<Int(buffer.frameLength) { let v = data[c][i]; peak = max(peak, abs(v)); sum += Double(v * v) }
+            }
+            let n = Int(buffer.frameLength) * Int(buffer.format.channelCount)
+            let (p, q) = (peak, sum)
+            box.withLock { $0.peak = max($0.peak, p); $0.sum += q; $0.count += n }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            mixer.removeTap(onBus: 0)
+            let r = box.withLock { $0 }
+            let db = { (x: Double) in x > 0 ? 20 * log10(x) : -120 }
+            done(String(format: "peak=%.1f rms=%.1f", db(Double(r.peak)), db(sqrt(r.sum / Double(max(1, r.count))))))
+        }
+    }
+
+    /// The engine's graph as AVAudioEngine prints it (debug).
+    func debugGraph() -> String { engine.description }
+
     /// Voices alive per slot and the slots in use (debug only; racy read, fine for a check).
     func debugSlots() -> String {
         "voices=\(voices.map(\.count)) buses=\(slotByBus)"
     }
     #endif
 
+    /// An output mixer to the mix and, at `send` level, to the room (only before the engine starts).
+    private func connectOutput(_ node: AVAudioMixerNode, send: Float, format: AVAudioFormat) {
+        let main = engine.mainMixerNode
+        let sendBus = roomSend.nextAvailableInputBus
+        engine.connect(node, to: [AVAudioConnectionPoint(node: main, bus: main.nextAvailableInputBus),
+                                  AVAudioConnectionPoint(node: roomSend, bus: sendBus)], fromBus: 0, format: format)
+        node.destination(forMixer: roomSend, bus: sendBus)?.volume = send
+    }
+
     /// Adds another sound source (the sampler) to the same engine, straight into the mixer.
+    /// Adds a node to the engine, into `next` (a mixer: its next free input), or the main mix.
+    /// At the engine's rate: samplers otherwise render at 44.1 kHz and get converted.
     func attach(_ node: AVAudioNode, to next: AVAudioNode? = nil) {
         start()
         engine.attach(node)
-        engine.connect(node, to: next ?? engine.mainMixerNode, format: nil)
+        if let mixer = (next ?? engine.mainMixerNode) as? AVAudioMixerNode {
+            engine.connect(node, to: mixer, fromBus: 0, toBus: mixer.nextAvailableInputBus, format: format)
+        } else {
+            engine.connect(node, to: next!, format: format)
+        }
     }
 
     func detach(_ node: AVAudioNode) {
@@ -241,10 +325,10 @@ final class Synth: @unchecked Sendable {
 
     /// Starts one note and returns its id for `noteOff`.
     @discardableResult
-    func noteOn(midi: Int, patch: Patch, slot: Int = 0, at time: Double? = nil) -> Int {
+    func noteOn(midi: Int, patch: Patch, slot: Int = 0, at time: Double? = nil, velocity: Double = 1) -> Int {
         let id = nextId
         nextId += 1
-        let voice = Voice(id: id, midi: Double(midi), patch: patch,
+        let voice = Voice(id: id, midi: Double(midi), patch: patch, velocity: velocity,
                           table: patch.oscillators.contains { $0.enabled && $0.wave == .custom }
                               ? Self.wavetable(patch.harmonics) : [],
                           sampleRate: sampleRate)
@@ -386,6 +470,10 @@ private struct Voice {
     let frequency: Double
     let table: [Float]
     var live: LiveParams
+    /// Velocity as gain (0.35…1), kept apart from the patch so live edits don't reset it.
+    let velocity: Double
+    /// Output gain now, gliding to `live.peak · velocity` (no clicks when the volume moves).
+    private var gain = -1.0
 
     // Amp envelope (0…1, scaled by `live.peak`).
     private let attack: Double
@@ -394,7 +482,10 @@ private struct Voice {
     private let patchRelease: Double
     private var level = 0.0
     private var stage = Stage.attack
-    private var releaseStep = 0.0
+    /// Exponential decay and release: the level falls by a constant ratio per sample (linear
+    /// ramps sounded like a fade, not a ring). Patch times were tuned for linear ramps, so −60 dB
+    /// comes at 3× the decay and 2.5× the release: about as long and loud as before, but ringing.
+    private var releaseCoef = 0.0
     private(set) var finished = false
     /// Frames of silence before it starts (scheduled notes), and a release waiting for its frame.
     var delay = 0
@@ -411,8 +502,9 @@ private struct Voice {
 
     private enum Stage { case attack, decay, sustain, release }
 
-    init(id: Int, midi: Double, patch: Patch, table: [Float], sampleRate: Double) {
+    init(id: Int, midi: Double, patch: Patch, velocity: Double, table: [Float], sampleRate: Double) {
         self.id = id
+        self.velocity = velocity
         self.patch = patch.id.hashValue
         frequency = Music.frequency(midi)
         self.table = table
@@ -432,7 +524,7 @@ private struct Voice {
         guard stage != .release else { return }
         stage = .release
         let time = max(0.01, seconds ?? patchRelease)
-        releaseStep = level / (time * sampleRate)
+        releaseCoef = exp(-6.9 / (2.5 * time * sampleRate))
     }
 
     /// Cutoff right now, following the filter envelope (exponential rise, then decay back).
@@ -495,8 +587,11 @@ private struct Voice {
     mutating func render(into out: UnsafeMutablePointer<Float>, frames: Int, sampleRate: Double, bendRatio: Double) {
         let dtime = 1 / sampleRate
         let attackStep = 1 / (attack * sampleRate)
-        let decayStep = (1 - sustain) / (decay * sampleRate)
+        let decayCoef = exp(-6.9 / (3 * decay * sampleRate))
         let vib = live.vibrato
+        let target = live.peak * velocity
+        if gain < 0 { gain = target }
+        let glide = 1 - exp(-1 / (0.005 * sampleRate))
 
         for f in 0..<frames {
             if let pending = pendingRelease {
@@ -513,14 +608,15 @@ private struct Voice {
                 level += attackStep
                 if level >= 1 { level = 1; stage = .decay }
             case .decay:
-                level -= decayStep
-                if level <= sustain { level = sustain; stage = .sustain }
+                level = sustain + (level - sustain) * decayCoef
+                if level - sustain < 1e-4 { level = sustain; stage = .sustain }
             case .sustain:
                 level = sustain
             case .release:
-                level -= releaseStep
-                if level <= 0 { level = 0; finished = true }
+                level *= releaseCoef
+                if level < 1e-4 { level = 0; finished = true }
             }
+            gain += (target - gain) * glide
             if finished { return }
 
             if coefCountdown <= 0 {
@@ -549,7 +645,7 @@ private struct Voice {
             let y = b0 * mix + z1
             z1 = b1 * mix - a1 * y + z2
             z2 = b2 * mix - a2 * y
-            out[f] += Float(y * level * live.peak)
+            out[f] += Float(y * level * gain)
             time += dtime
         }
     }

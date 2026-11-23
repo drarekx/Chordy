@@ -328,6 +328,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if let i = Int(command.dropFirst(10)), book.sheets.indices.contains(i) { book.open(book.sheets[i].id) }
                 case let command? where command.hasPrefix("sheetseek:"):
                     if let i = Int(command.dropFirst(10)) { AppModel.shared.songbook.seek(i) }
+                case let command? where command.hasPrefix("meter:"):
+                    // meter:<seconds>,<file>[,<label>] appends «label peak=… rms=…» (main mix, before the limiter).
+                    let p = command.dropFirst(6).split(separator: ",", maxSplits: 2).map(String.init)
+                    if p.count >= 2, let seconds = Double(p[0]) {
+                        let label = p.count > 2 ? p[2] : ""
+                        Synth.shared.debugMeter(seconds: seconds) { line in
+                            let text = "\(label) \(line)\n"
+                            if let h = FileHandle(forWritingAtPath: p[1]) { h.seekToEndOfFile(); h.write(Data(text.utf8)); h.closeFile() }
+                            else { try? text.write(toFile: p[1], atomically: true, encoding: .utf8) }
+                        }
+                    }
+                case let command? where command.hasPrefix("graph:"):
+                    try? Synth.shared.debugGraph().write(toFile: String(command.dropFirst(6)), atomically: true, encoding: .utf8)
                 case "midiplay": AppModel.shared.songbook.player.toggle()
                 case let command? where command.hasPrefix("midipractice:"):
                     // midipractice:<track|none>; mididump:<file> writes the player's state.

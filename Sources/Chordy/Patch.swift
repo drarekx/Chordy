@@ -180,7 +180,8 @@ extension Patch {
               harmonics: Harmonics.sine,
               filter: Filter(type: .lowpass, cutoff: 380, resonance: 1.5, envAmount: 1.5, envDecay: 0.15),
               envelope: Envelope(attack: 0.004, decay: 0.3, sustain: 0.85, release: 0.12),
-              vibrato: Vibrato(rate: 5, depth: 0), volume: 0.7),
+              // 0.7 measured ~6 dB over the other sounds.
+              vibrato: Vibrato(rate: 5, depth: 0), volume: 0.35),
         Patch(id: "builtin:strings", name: "Strings",
               oscillators: [osc(.sawtooth, detune: -7, level: 0.75), osc(.sawtooth, detune: 7, level: 0.75), osc(.sawtooth, octave: 1, detune: 3, level: 0.3)],
               harmonics: Harmonics.saw,

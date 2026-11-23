@@ -119,6 +119,34 @@ struct Instrument: Identifiable, Hashable {
 
     static func with(_ id: String) -> Instrument? { all.first { $0.id == id } ?? generalMidi(id) }
 
+    /// Gain (dB) that brings this sound to the same loudness as the others: a chord at
+    /// velocity 100 measured on the main mix ≈ −23 dBFS RMS (debug hook `meter:`, 23-11-2026).
+    /// Banks differ by up to 25 dB (the warm pad clipped; the macOS piano was barely audible).
+    var trimDB: Float {
+        if bankMSB == 120 { return 0 }
+        switch pack {
+        case InstrumentPack.salamander.id: return 2
+        case InstrumentPack.upright.id: return 2.5
+        case InstrumentPack.system.id: return program < 8 ? 11.5 : 0
+        case InstrumentPack.generalUser.id:
+            switch program {
+            case 0...7: return -1
+            case 16...23: return -3.5
+            case 24: return 7.5
+            case 25...31: return -1
+            case 32...39: return 2.5
+            case 40...51: return -2.5
+            case 52...55: return -4
+            case 64...71: return 0.5
+            case 72...79: return -3.5
+            case 88, 89: return -14
+            case 90: return 1.5
+            default: return 0
+            }
+        default: return 0
+        }
+    }
+
     /// Any General MIDI program, for MIDI files: «gm:<pack>:<program>» or «gm:<pack>:kit<kit>».
     static func generalMidi(program: Int, drums: Bool, pack: InstrumentPack) -> String {
         "gm:\(pack.id):\(drums ? "kit" : "")\(max(0, min(127, program)))"
@@ -314,6 +342,7 @@ final class InstrumentLibrary: NSObject, ObservableObject, URLSessionDownloadDel
     private func load(_ instrument: Instrument, into player: SamplerPlayer) {
         guard let pack = InstrumentPack.with(instrument.pack), let url = fileURL(pack) else { return }
         if selectedId == instrument.id { loading = true }
+        player.trimDB = instrument.trimDB
         player.load(url: url, program: instrument.program, bankMSB: instrument.bankMSB) { [weak self] ok in
             guard let self else { return }
             if self.selectedId == instrument.id { self.loading = false }
@@ -538,6 +567,10 @@ final class SamplerPlayer {
     /// so the master limiter only catches rare peaks.
     nonisolated static let headroomDB: Float = -6
     private var level = 1.0
+    /// The volume knob (0…1).
+    private var knob = 1.0
+    /// Evens this instrument with the rest (`Instrument.trimDB`).
+    var trimDB: Float = 0 { didSet { applyGain() } }
     /// Effects bus this sampler plays through, if any.
     var bus: String?
     /// The unit renders only once its bank is in: loading into a sampler that is rendering
@@ -580,7 +613,7 @@ final class SamplerPlayer {
                     // Sampler → filter → delay → reverb → mixer. Headroom comes from the sampler's
                     // gain; only the master limiter guards 0 dBFS.
                     if !self.chainAttached {
-                        Synth.shared.attach(self.reverb)
+                        Synth.shared.attach(self.reverb, to: Synth.shared.samplerBus)
                         Synth.shared.attach(self.delay, to: self.reverb)
                         Synth.shared.attach(self.eq, to: self.delay)
                         self.chainAttached = true
@@ -612,8 +645,9 @@ extension Effects {
         delay.lowPassCutoff = 9000
         delay.wetDryMix = Float(e.delay * 50)
         delay.bypass = e.delay <= 0.001
-        reverb.loadFactoryPreset(.mediumHall)
-        reverb.wetDryMix = Float(e.reverb * 60)
+        // A bus's own reverb, on top of the shared room: capped so the dry sound isn't crossfaded away.
+        reverb.loadFactoryPreset(.largeRoom)
+        reverb.wetDryMix = Float(e.reverb * 40)
         reverb.bypass = e.reverb <= 0.001
     }
 }
@@ -632,13 +666,14 @@ extension SamplerPlayer {
     }
 
     /// AUSampler applies the SF2 velocity curve, which is very steep: velocity 30 sounds ~40 dB
-    /// under 127, almost silent. Squeeze 1…127 into 45…127 so soft playing stays audible
-    /// (≈ 25–30 dB of dynamics, like a real piano) and the keyboard feels even.
+    /// under 127, almost silent. Map 1…127 to 15…127: soft playing stays audible and reaches the
+    /// soft (darker) sample layers. Measured: velocity 40 → 127 spans ~16 dB (45…127 gave only
+    /// 8–10 dB, so playing softly hardly sounded soft).
     static func curve(_ velocity: Int) -> UInt8 { curveValue(velocity) }
 
     nonisolated static func curveValue(_ velocity: Int) -> UInt8 {
         let v = Double(max(1, min(127, velocity))) / 127
-        return UInt8((45 + 82 * pow(v, 0.75)).rounded())
+        return UInt8((15 + 112 * v).rounded())
     }
 
     func noteOff(_ id: Int, at time: Double? = nil) {
@@ -668,7 +703,14 @@ extension SamplerPlayer {
 
     func setModulation(_ value: Double) { guard ready else { return }; unit.sendController(1, withValue: UInt8(value * 127), onChannel: 0) }
 
-    func setVolume(_ value: Double) { unit.volume = Float(value) }
+    /// The volume knob. `unit.volume` did nothing here: it only works when the unit feeds a
+    /// mixer, and the sampler feeds its filter.
+    func setVolume(_ value: Double) {
+        let clamped = max(0, min(1, value))
+        guard clamped != knob else { return }
+        knob = clamped
+        applyGain()
+    }
 
     /// Keyboard or loops volume as gain (1 = the 0.85 default), not velocity.
     func setLevel(_ value: Double) {
@@ -679,8 +721,9 @@ extension SamplerPlayer {
     }
 
     private func applyGain() {
-        let db = level > 0.0001 ? Float(20 * log10(level)) : -90
-        unit.overallGain = max(-90, min(12, Self.headroomDB + db))
+        let gain = level * knob
+        let db = gain > 0.0001 ? Float(20 * log10(gain)) : -90
+        unit.overallGain = max(-90, min(18, Self.headroomDB + trimDB + db))
     }
 }
 
@@ -716,11 +759,12 @@ final class SoundOutput {
             samplerNotes[ours] = (player, player.noteOn(midi: midi, velocity: velocity, at: time))
             return ours
         }
-        var sound = patch(InstrumentLibrary.synthPatchId(plain))
-        sound.volume *= 0.35 + 0.65 * Double(velocity) / 127
+        let sound = patch(InstrumentLibrary.synthPatchId(plain))
         let bus = SoundRoute.parse(id).bus
         let slot = Synth.shared.slot(for: bus, effects: bus.flatMap { instruments.effects($0) } ?? .none)
-        return Synth.shared.noteOn(midi: midi, patch: sound, slot: slot, at: time)
+        // Velocity is the voice's own gain (not baked into the patch): live edits keep it.
+        return Synth.shared.noteOn(midi: midi, patch: sound, slot: slot, at: time,
+                                   velocity: 0.35 + 0.65 * Double(max(1, min(127, velocity))) / 127)
     }
 
     /// `pedal: false` for loop notes: the sustain pedal only holds what the player plays.

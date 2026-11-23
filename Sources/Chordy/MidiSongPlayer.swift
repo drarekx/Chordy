@@ -136,6 +136,16 @@ final class MidiSongPlayer: ObservableObject {
 
     /// Sound of a track: its General MIDI program in the best bank available.
     func route(_ track: MidiScore.Track) -> String {
+        // GeneralUser's grand pianos (programs 0–1) crash AUSampler: pianos go to the grand or
+        // upright piano when downloaded, else to macOS's bank.
+        if !track.drums, (0...2).contains(track.program) {
+            for piano in ["salamander", "upright"] {
+                if let i = Instrument.with(piano), let pack = InstrumentPack.with(i.pack), instruments.fileURL(pack) != nil {
+                    return SoundRoute.make(piano, bus: "midi")
+                }
+            }
+            return SoundRoute.make(Instrument.generalMidi(program: track.program, drums: false, pack: .system), bus: "midi")
+        }
         let pack = instruments.fileURL(.generalUser) != nil ? InstrumentPack.generalUser : InstrumentPack.system
         return SoundRoute.make(Instrument.generalMidi(program: track.program, drums: track.drums, pack: pack), bus: "midi")
     }
