@@ -16,6 +16,8 @@ struct LoopEvent: Codable, Equatable {
     var velocity = 100
     /// Sound it was played with (two keyboards can record into one take); nil = the loop's.
     var instrument: String?
+    /// Take it was recorded in: nil = the main one, 1, 2… = recorded over it later.
+    var take: Int?
     var start: Double
     var length: Double
 
@@ -38,6 +40,7 @@ struct LoopEvent: Codable, Equatable {
         midi = try c.decodeIfPresent(Int.self, forKey: .midi)
         velocity = try c.decodeIfPresent(Int.self, forKey: .velocity) ?? 100
         instrument = try c.decodeIfPresent(String.self, forKey: .instrument)
+        take = try c.decodeIfPresent(Int.self, forKey: .take)
         start = try c.decode(Double.self, forKey: .start)
         length = try c.decode(Double.self, forKey: .length)
     }
@@ -57,6 +60,18 @@ struct Loop: Codable, Equatable, Identifiable {
     var instrument: String?
     /// Reverb, delay and filter for this loop's sampled sounds.
     var effects: Effects?
+    /// Protected: can't be edited, renamed, trimmed or deleted (only played, copied, recoloured).
+    var locked: Bool?
+    /// Colour (index in `KeyboardConfig.palette`), to tell loops apart in the song; nil = default.
+    var color: Int?
+    /// Takes that don't sound (an alternative kept for later); 0 = the main take.
+    var mutedTakes: [Int]?
+
+    func isMuted(_ e: LoopEvent) -> Bool { mutedTakes?.contains(e.take ?? 0) == true }
+    /// Takes present, main first.
+    var takes: [Int] { Array(Set(events.map { $0.take ?? 0 })).sorted() }
+
+    var isLocked: Bool { locked == true }
 }
 
 enum LoopMath {
@@ -320,13 +335,17 @@ final class Loops: ObservableObject {
         }
         engine.onChordPlayed { [weak self] chord in
             MainActor.assumeIsolated {
-                guard let self, self.recorderState == .recording else { return }
+                guard let self else { return }
+                if self.overdubbing != nil { self.overdub(chord: chord) }
+                guard self.recorderState == .recording else { return }
                 self.captured.append(chord)
             }
         }
         engine.onNotePlayed { [weak self] note in
             MainActor.assumeIsolated {
-                guard let self, self.recorderState == .recording else { return }
+                guard let self else { return }
+                if self.overdubbing != nil { self.overdub(note: note) }
+                guard self.recorderState == .recording else { return }
                 self.capturedNotes.append(note)
             }
         }
@@ -335,12 +354,14 @@ final class Loops: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] held in
                 if self?.recorderState == .armed, !held.isEmpty { self?.begin() }
+                if self?.overdubArmed != nil, !held.isEmpty { self?.fireArmedOverdub() }
             }
             .store(in: &cancellables)
         engine.$heldNotes
             .receive(on: RunLoop.main)
             .sink { [weak self] notes in
                 if self?.recorderState == .armed, !notes.isEmpty { self?.begin() }
+                if self?.overdubArmed != nil, !notes.isEmpty { self?.fireArmedOverdub() }
             }
             .store(in: &cancellables)
     }
@@ -366,7 +387,10 @@ final class Loops: ObservableObject {
 
     /// Save an edited loop over the original (or as itself when it is new).
     func save(_ edited: Loop) {
-        guard let i = loops.firstIndex(where: { $0.id == edited.id }) else { return }
+        guard let i = loops.firstIndex(where: { $0.id == edited.id }), !loops[i].isLocked else { return }
+        var edited = edited
+        edited.locked = loops[i].locked
+        edited.color = loops[i].color
         let wasPlaying = playingId == edited.id
         loops[i] = edited
         previewEffects[edited.id] = nil
@@ -383,6 +407,7 @@ final class Loops: ObservableObject {
         copy.id = UUID().uuidString
         copy.name = tr("%@ (copia)", loops[i].name)
         copy.createdAt = Date()
+        copy.locked = nil
         loops.insert(copy, at: i + 1)
         selectedId = copy.id
         persist()
@@ -391,7 +416,7 @@ final class Loops: ObservableObject {
 
     func rename(_ id: String, to name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, let i = loops.firstIndex(where: { $0.id == id }) else { return }
+        guard !trimmed.isEmpty, let i = loops.firstIndex(where: { $0.id == id }), !loops[i].isLocked else { return }
         loops[i].name = trimmed
         persist()
     }
@@ -404,14 +429,31 @@ final class Loops: ObservableObject {
         persist()
     }
 
+    func isLocked(_ id: String) -> Bool { loops.first { $0.id == id }?.isLocked ?? false }
+
+    /// Protect or unprotect a loop.
+    func setLocked(_ id: String, _ locked: Bool) {
+        guard let i = loops.firstIndex(where: { $0.id == id }) else { return }
+        loops[i].locked = locked ? true : nil
+        persist()
+    }
+
+    /// Colour shown in lists and in the song (allowed on protected loops too: it's only a label).
+    func setColor(_ id: String, _ color: Int?) {
+        guard let i = loops.firstIndex(where: { $0.id == id }) else { return }
+        loops[i].color = color
+        persist()
+    }
+
     func remove(_ id: String) {
+        guard !isLocked(id) else { return }
         if playingId == id { stopPlayback() }
         loops.removeAll { $0.id == id }
         persist()
     }
 
     func update(_ id: String, length: Double, events: [LoopEvent]) {
-        guard let i = loops.firstIndex(where: { $0.id == id }) else { return }
+        guard let i = loops.firstIndex(where: { $0.id == id }), !loops[i].isLocked else { return }
         let wasPlaying = playingId == id
         loops[i].lengthBeats = length
         loops[i].events = events
@@ -434,6 +476,111 @@ final class Loops: ObservableObject {
         } catch {
             NSLog("Chordy: could not save loops: \(error)")
         }
+    }
+
+    // MARK: Recording over a loop
+
+    /// Loop being recorded over (it must be playing): what you play lands on it as a new take.
+    @Published private(set) var overdubbing: String?
+    /// A loop just created to record into: the editor starts recording when it opens it.
+    @Published var recordOnOpen: String?
+    /// Notes caught so far, in beats of the playing loop (kept apart so playback doesn't restart).
+    @Published private(set) var overdubEvents: [LoopEvent] = []
+    private var overdubTake: Int?
+
+    /// Waiting for the first key to start a loop and record over it.
+    @Published private(set) var overdubArmed: String?
+    private var armedLoop: Loop?
+    private var armedTake: Int?
+    private var armedStart: (() -> Void)?
+
+    /// Silence until the first key: then `loop` starts with its beat 1 on that key and what you
+    /// play records into `take`. `started` runs then (the editor marks itself as playing).
+    func armOverdub(_ loop: Loop, take: Int?, started: @escaping () -> Void) {
+        guard !isLocked(loop.id) else { return }
+        stopPlayback()
+        overdubArmed = loop.id
+        armedLoop = loop
+        armedTake = take
+        armedStart = started
+        if !engine.held.isEmpty || !engine.heldNotes.isEmpty { fireArmedOverdub() }
+    }
+
+    func disarmOverdub() {
+        overdubArmed = nil
+        armedLoop = nil
+        armedStart = nil
+    }
+
+    private func fireArmedOverdub() {
+        guard let loop = armedLoop else { return }
+        let first = (engine.heldChords().map(\.start) + engine.heldNotesPlayed().map(\.start)).min() ?? now()
+        let take = armedTake, started = armedStart
+        disarmOverdub()
+        play(loop, downbeat: first)
+        startOverdub(take: take)
+        started?()
+    }
+
+    /// Start recording over the playing loop into `take` (nil = the main take of an empty loop).
+    func startOverdub(take: Int?) {
+        guard let loop = playing, !isLocked(loop.id) else { return }
+        overdubbing = loop.id
+        overdubTake = take
+        overdubEvents = []
+    }
+
+    /// Stop and hand back what was played (notes still held end now).
+    func stopOverdub() -> [LoopEvent] {
+        guard overdubbing != nil else { return [] }
+        let end = now()
+        for c in engine.heldChords(end: end) { overdub(chord: c) }
+        for n in engine.heldNotesPlayed(end: end) { overdub(note: n) }
+        let events = overdubEvents
+        overdubbing = nil
+        overdubEvents = []
+        return events
+    }
+
+    /// Where in the playing loop a moment falls, and how many loop beats a span lasts.
+    private func overdubSpan(_ start: Double, _ end: Double) -> (Double, Double)? {
+        guard let loop = playing, loop.lengthBeats > 0 else { return nil }
+        let transport = Transport.shared.snapshot
+        let b0 = transport.beat(at: start) - anchorBeat, b1 = transport.beat(at: end) - anchorBeat
+        guard b1 > 0 else { return nil }
+        let from = max(0, b0)
+        let position = from.truncatingRemainder(dividingBy: loop.lengthBeats)
+        return (position, min(loop.lengthBeats, max(1.0 / 16, b1 - from)))
+    }
+
+    private func overdub(chord c: PlayedChord) {
+        guard let (start, length) = overdubSpan(c.start, c.end) else { return }
+        var e = LoopEvent(degree: c.degree, color: c.color, octave: c.octave, accidental: c.accidental, start: start, length: length)
+        e.instrument = c.instrument.map { SoundRoute.parse($0).instrument }
+        e.velocity = c.velocity
+        e.take = overdubTake
+        overdubEvents.append(e)
+    }
+
+    private func overdub(note n: PlayedNote) {
+        guard let (start, length) = overdubSpan(n.start, n.end) else { return }
+        var e = LoopEvent(degree: 1, color: .diatonic, start: start, length: length)
+        e.midi = n.midi
+        e.velocity = n.velocity
+        e.instrument = n.instrument.map { SoundRoute.parse($0).instrument }
+        e.take = overdubTake
+        overdubEvents.append(e)
+    }
+
+    /// An empty loop to record into: whole bars, today's tempo, key and sound.
+    func createEmpty(bars: Int = 4) -> Loop {
+        let loop = Loop(id: UUID().uuidString, name: nextName(), createdAt: Date(), bpm: engine.bpm, tonic: engine.tonic,
+                        flavor: engine.flavor, lengthBeats: Double(max(1, bars)) * LoopMath.beatsPerBar, events: [],
+                        instrument: instruments.selectedId)
+        loops.insert(loop, at: 0)
+        selectedId = loop.id
+        persist()
+        return loop
     }
 
     // MARK: Recorder
@@ -543,7 +690,9 @@ final class Loops: ObservableObject {
     /// Plays in the key, mode and tempo it was recorded in (the tempo only when nothing else is
     /// playing: drums keep theirs); follows live changes after that. Starts on the next bar line
     /// of whatever already plays.
-    func play(_ loop: Loop) {
+    /// `downbeat`: start the loop's beat 1 at this moment (a key just pressed) instead of on the
+    /// next bar line; with drums already playing it snaps to their bar line, like the recorder.
+    func play(_ loop: Loop, downbeat: Double? = nil) {
         stopPlayback()
         engine.tonic = loop.tonic
         engine.flavor = loop.flavor
@@ -553,7 +702,17 @@ final class Loops: ObservableObject {
         }
         playing = loop
         playingId = loop.id
-        anchorBeat = Transport.shared.join("loops")
+        if let downbeat {
+            if Transport.shared.isRunning {
+                let beat = Transport.shared.beat(at: downbeat)
+                _ = Transport.shared.join("loops")
+                anchorBeat = ((beat + 0.5) / LoopMath.beatsPerBar).rounded(.down) * LoopMath.beatsPerBar
+            } else {
+                anchorBeat = Transport.shared.join("loops", downbeat: downbeat)
+            }
+        } else {
+            anchorBeat = Transport.shared.join("loops")
+        }
         scheduledBeat = anchorBeat - 1e-9
         lastProgress = 0
         let timer = Timer(timeInterval: 0.01, repeats: true) { [weak self] _ in
@@ -568,6 +727,8 @@ final class Loops: ObservableObject {
     func preview(_ draft: Loop) { play(draft) }
 
     func stopPlayback() {
+        overdubbing = nil
+        overdubEvents = []
         playTimer?.invalidate()
         playTimer = nil
         if let loop = playing {
@@ -612,7 +773,7 @@ final class Loops: ObservableObject {
         if lastCycle >= 0 {
             for cycle in max(-1, firstCycle - 1)...lastCycle {
                 let base = anchorBeat + Double(cycle) * length
-                for (i, event) in loop.events.enumerated() {
+                for (i, event) in loop.events.enumerated() where !loop.isMuted(event) {
                     var on = base + event.start
                     let off = base + event.start + min(length, event.length)
                     if cycle < 0 {

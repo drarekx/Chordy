@@ -181,7 +181,8 @@ struct SongView: View {
         let playing = loops.playingId == loop.id
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Circle().fill(Theme.accentFill).frame(width: 7, height: 7)
+                Circle().fill(loop.tint ?? Theme.accentFill).frame(width: 9, height: 9)
+                if loop.isLocked { Image(systemName: "lock.fill").font(.system(size: 9)).foregroundStyle(Theme.warn) }
                 Text(loop.name.trimmingCharacters(in: .whitespaces).isEmpty ? tr("Loop") : loop.name)
                     .font(.system(size: 12, weight: .semibold)).lineLimit(1).layoutPriority(1)
                 Spacer(minLength: 2)
@@ -195,7 +196,8 @@ struct SongView: View {
                 .buttonStyle(.plain)
                 .help(tr("Escuchar"))
             }
-            LoopPreview(events: loop.events, length: loop.lengthBeats, progress: playing ? loops.progress : nil).frame(height: 24)
+            LoopPreview(events: loop.events, length: loop.lengthBeats, progress: playing ? loops.progress : nil, tint: loop.tint)
+                .frame(height: 24)
         }
         .padding(9)
         .background(Theme.card, in: RoundedRectangle(cornerRadius: 10))
@@ -389,7 +391,11 @@ struct SongView: View {
 
     private func drawClip(_ context: GraphicsContext, _ c: SongData.Clip) {
         guard let r = clipRect(c), let track = song.data.tracks.first(where: { $0.id == c.track }) else { return }
-        let color = trackColor(track)
+        // A loop with its own colour shows it; otherwise the track's.
+        let color: Color = {
+            if case .loop(let id) = c.source, let tint = loops.loops.first(where: { $0.id == id })?.tint { return tint }
+            return trackColor(track)
+        }()
         let shape = Path(roundedRect: r, cornerRadius: 8)
         context.fill(shape, with: .color(color.opacity(0.2)))
         context.stroke(shape, with: .color(selected == c.id ? Theme.text : color), lineWidth: selected == c.id ? 2 : 1.2)

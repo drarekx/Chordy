@@ -41,6 +41,7 @@ struct LoopPanel: View {
 
 private struct RecorderBar: View {
     @ObservedObject var loops: Loops
+    @AppStorage("newLoopBars") private var newBars = 4
 
     var body: some View {
         HStack(spacing: 10) {
@@ -49,12 +50,25 @@ private struct RecorderBar: View {
                     Image(systemName: loops.recorderState == .idle ? "record.circle" : "stop.circle.fill")
                     Text(label)
                 }
+                .fixedSize()
             }
             .buttonStyle(AppButtonStyle(kind: loops.recorderState == .idle ? .secondary : .primary))
             .help(tr("Grabar loop (R)"))
-            Text(status).monospacedText(size: 12)
+            Button { newLoop(bars: newBars) } label: { Label(tr("Nuevo"), systemImage: "plus").fixedSize() }
+                .buttonStyle(AppButtonStyle(kind: .secondary))
+                .disabled(loops.recorderState != .idle)
+                .help(tr("Loop vacío que se repite mientras grabas encima en el editor"))
+            Menu {
+                ForEach([1, 2, 4, 8], id: \.self) { bars in Button(tr("%d compases", bars)) { newBars = bars } }
+            } label: { Text("\(newBars)c").font(.system(size: 11, design: .monospaced)) }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help(tr("Compases del loop nuevo"))
+            Text(status).monospacedText(size: 11)
                 .foregroundStyle(loops.recorderState == .recording ? Theme.danger : Theme.text3)
-            Spacer()
+                .lineLimit(1).truncationMode(.tail)
+                .layoutPriority(-1)
+            Spacer(minLength: 0)
             Menu {
                 Button(tr("Tal cual lo tocas")) { loops.recordQuantize = 0 }
                 Button(tr("Semicorcheas")) { loops.recordQuantize = 0.25 }
@@ -68,8 +82,16 @@ private struct RecorderBar: View {
             .help(tr("Cómo se encajan las notas al grabar"))
             Toggle(tr("Clic"), isOn: $loops.metronome)
                 .toggleStyle(.checkbox)
+                .fixedSize()
                 .help(tr("Metrónomo mientras grabas"))
         }
+    }
+
+    private func newLoop(bars: Int) {
+        let loop = loops.createEmpty(bars: bars)
+        loops.recordOnOpen = loop.id
+        loops.studioId = loop.id
+        UserDefaults.standard.set("editor", forKey: "mainMode")
     }
 
     private var label: String {
@@ -109,17 +131,23 @@ private struct LoopRow: View {
                 IconButton(symbol: playing ? "stop.fill" : "play.fill",
                            label: playing ? tr("Parar") : tr("Reproducir"),
                            kind: playing ? .primary : .secondary) { loops.togglePlay(loop.id) }
+                LoopColorButton(loops: loops, loop: loop)
                 VStack(alignment: .leading, spacing: 1) {
-                    if renaming {
+                    if renaming && !loop.isLocked {
                         TextField("", text: $name)
                             .textFieldStyle(.plain)
                             .font(.system(size: 13, weight: .semibold))
                             .onSubmit { loops.rename(loop.id, to: name); renaming = false }
                             .onExitCommand { renaming = false }
                     } else {
-                        Text(loop.name).font(.system(size: 13, weight: .semibold))
-                            .onTapGesture(count: 2) { name = loop.name; renaming = true }
-                            .help(tr("Doble clic para renombrar"))
+                        HStack(spacing: 4) {
+                            if loop.isLocked {
+                                Image(systemName: "lock.fill").font(.system(size: 10)).foregroundStyle(Theme.warn)
+                            }
+                            Text(loop.name).font(.system(size: 13, weight: .semibold))
+                        }
+                        .onTapGesture(count: 2) { if !loop.isLocked { name = loop.name; renaming = true } }
+                        .help(loop.isLocked ? tr("Protegido: desbloquéalo para cambiarlo") : tr("Doble clic para renombrar"))
                     }
                     Text("\(LoopMath.formatLength(loop.lengthBeats)) · \(loop.tonic.rawValue) \(loop.flavor.label) · \(loop.bpm) bpm"
                          + (loop.instrument.map { " · " + Keyboards.soundName($0) } ?? ""))
@@ -132,8 +160,17 @@ private struct LoopRow: View {
                     UserDefaults.standard.set("editor", forKey: "mainMode")
                 }
                 IconButton(symbol: "plus.square.on.square", label: tr("Duplicar")) { loops.duplicate(loop.id) }
+                IconButton(symbol: loop.isLocked ? "lock.fill" : "lock.open",
+                           label: loop.isLocked ? tr("Protegido: no se puede cambiar ni borrar (clic para desbloquear)")
+                                                : tr("Proteger: que no se pueda cambiar ni borrar"),
+                           kind: loop.isLocked ? .primary : .ghost) {
+                    loops.setLocked(loop.id, !loop.isLocked)
+                    if !loop.isLocked, editing { toggleEditor() }
+                }
                 IconButton(symbol: "scissors", label: tr("Recortar"), kind: editing ? .primary : .ghost, action: toggleEditor)
-                IconButton(symbol: "trash", label: tr("Borrar")) { confirmingDelete = true }
+                    .disabled(loop.isLocked)
+                IconButton(symbol: "trash", label: loop.isLocked ? tr("Protegido: no se puede borrar") : tr("Borrar")) { confirmingDelete = true }
+                    .disabled(loop.isLocked)
                     .confirmationDialog(tr("¿Borrar «%@»?", loop.name), isPresented: $confirmingDelete) {
                         Button(tr("Borrar"), role: .destructive) {
                             AppModel.shared.song.removeClips(of: loop.id)
@@ -146,12 +183,17 @@ private struct LoopRow: View {
                                       : tr("No se puede deshacer."))
                     }
             }
-            LoopPreview(events: loop.events, length: loop.lengthBeats, progress: playing ? loops.progress : nil)
+            LoopPreview(events: loop.events, length: loop.lengthBeats, progress: playing ? loops.progress : nil, tint: loop.tint)
                 .frame(height: 36)
         }
         .padding(10)
         .background(loops.selectedId == loop.id ? Theme.navSelected : Theme.card, in: RoundedRectangle(cornerRadius: 10))
         .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.line) }
+        .overlay(alignment: .leading) {
+            if let tint = loop.tint {
+                UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 10).fill(tint).frame(width: 4)
+            }
+        }
         .overlay(alignment: .topTrailing) {
             if loop.effects != nil {
                 Image(systemName: "sparkles").font(.system(size: 9)).foregroundStyle(Theme.accentText).padding(5)
@@ -167,6 +209,8 @@ struct LoopPreview: View {
     let events: [LoopEvent]
     let length: Double
     let progress: Double?
+    /// The loop's colour; nil = accent.
+    var tint: Color? = nil
 
     var body: some View {
         Canvas { context, size in
@@ -179,7 +223,7 @@ struct LoopPreview: View {
                 let rect = CGRect(x: size.width * e.start / length, y: size.height * slot.top + 0.5,
                                   width: max(2, size.width * min(e.length, length - e.start) / length - 1),
                                   height: max(1.5, size.height * slot.height - 1))
-                context.fill(Path(roundedRect: rect, cornerRadius: 1.5), with: .color(Theme.accentFill))
+                context.fill(Path(roundedRect: rect, cornerRadius: 1.5), with: .color(tint ?? Theme.accentFill))
             }
             if let progress {
                 let x = size.width * progress
@@ -343,5 +387,48 @@ private struct TrimTimeline: View {
 
     private func handle(at x: CGFloat, height: CGFloat) -> some View {
         Rectangle().fill(Theme.accent).frame(width: 3, height: height).offset(x: x - 1.5)
+    }
+}
+
+extension Loop {
+    /// Its colour, if it has one.
+    var tint: Color? { color.map { KeyboardConfig.palette[$0 % KeyboardConfig.palette.count] } }
+}
+
+/// A dot with the loop's colour; click to pick another (or none). Works on protected loops too.
+struct LoopColorButton: View {
+    @ObservedObject var loops: Loops
+    let loop: Loop
+    var size: CGFloat = 14
+    @State private var picking = false
+
+    var body: some View {
+        Button { picking = true } label: {
+            Circle().fill(loop.tint ?? Theme.control)
+                .overlay { Circle().strokeBorder(loop.tint == nil ? Theme.lineStrong : .clear, style: StrokeStyle(lineWidth: 1, dash: [2])) }
+                .frame(width: size, height: size)
+                .padding(4)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(tr("Color del loop (se ve en la canción)"))
+        .popover(isPresented: $picking) {
+            HStack(spacing: 8) {
+                ForEach(KeyboardConfig.palette.indices, id: \.self) { i in
+                    Button { loops.setColor(loop.id, i); picking = false } label: {
+                        Circle().fill(KeyboardConfig.palette[i]).frame(width: 22, height: 22)
+                            .overlay { Circle().strokeBorder(Theme.text, lineWidth: loop.color == i ? 2 : 0) }
+                    }
+                    .buttonStyle(.plain)
+                }
+                Button { loops.setColor(loop.id, nil); picking = false } label: {
+                    Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).frame(width: 22, height: 22)
+                        .background(Theme.control, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .help(tr("Sin color"))
+            }
+            .padding(12)
+        }
     }
 }

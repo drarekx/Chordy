@@ -292,6 +292,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     let lines = o.devices.map { "\($0.id) \($0.uid) | \($0.name)" }
                         + ["selected=\(o.selectedUID ?? "system") current=\(o.current?.name ?? "-") engine=\(Synth.shared.debugOutputDevice())"]
                     try? lines.joined(separator: "\n").write(toFile: String(command.dropFirst(10)), atomically: true, encoding: .utf8)
+                case let command? where command.hasPrefix("loopcolor:"):
+                    // loopcolor:<index>,<colour|-1>; looplock:<index>,<0|1>; loopdelete:<index> (tries to).
+                    let p = command.dropFirst(10).split(separator: ",").compactMap { Int($0) }
+                    let l = AppModel.shared.loops
+                    if p.count == 2, l.loops.indices.contains(p[0]) { l.setColor(l.loops[p[0]].id, p[1] < 0 ? nil : p[1]) }
+                case let command? where command.hasPrefix("looplock:"):
+                    let p = command.dropFirst(9).split(separator: ",").compactMap { Int($0) }
+                    let l = AppModel.shared.loops
+                    if p.count == 2, l.loops.indices.contains(p[0]) { l.setLocked(l.loops[p[0]].id, p[1] == 1) }
+                case let command? where command.hasPrefix("loopdelete:"):
+                    let l = AppModel.shared.loops
+                    if let i = Int(command.dropFirst(11)), l.loops.indices.contains(i) { l.remove(l.loops[i].id) }
                 case "editloop":
                     AppModel.shared.loops.studioId = AppModel.shared.loops.loops.first?.id
                     UserDefaults.standard.set("editor", forKey: "mainMode")

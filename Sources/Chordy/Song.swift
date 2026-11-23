@@ -289,7 +289,7 @@ final class Song: ObservableObject {
             guard clipEnd > scheduledTo, clipStart < horizon else { continue }
             // Notes crossing the loop's seam: the clip starts with their tail.
             if clipStart >= scheduledTo, clipStart < horizon {
-                for (i, e) in loop.events.enumerated() where e.start + e.length > loop.lengthBeats + 1e-6 {
+                for (i, e) in loop.events.enumerated() where e.start + e.length > loop.lengthBeats + 1e-6 && !loop.isMuted(e) {
                     let end = min(clipStart + e.start + e.length - loop.lengthBeats, clipEnd)
                     guard end > clipStart else { continue }
                     let noteId = "song:\(clip.id):tail:\(i)"
@@ -311,7 +311,7 @@ final class Song: ObservableObject {
             while true {
                 let base = clipStart + Double(rep) * loop.lengthBeats
                 if base >= min(clipEnd, horizon) { break }
-                for (i, e) in loop.events.enumerated() {
+                for (i, e) in loop.events.enumerated() where !loop.isMuted(e) {
                     let at = base + e.start
                     guard at >= scheduledTo, at < horizon, at < clipEnd else { continue }
                     let end = min(at + e.length, clipEnd)

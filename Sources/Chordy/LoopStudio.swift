@@ -71,6 +71,8 @@ struct LoopStudio: View {
 
     private var original: Loop? { loops.loops.first { $0.id == draft.id } }
     private var dirty: Bool { original != draft }
+    /// Protected loop: look, listen and copy, nothing else.
+    private var locked: Bool { original?.isLocked ?? false }
     private var gridStep: Double { grid > 0 ? grid : LoopMath.fine }
 
     var body: some View {
@@ -86,14 +88,22 @@ struct LoopStudio: View {
             }
         }
         .background(Theme.window)
-        .onAppear(perform: installMonitors)
+        .onAppear {
+            installMonitors()
+            if loops.recordOnOpen == draft.id {
+                loops.recordOnOpen = nil
+                toggleOverdub()
+            }
+        }
         .onDisappear {
+            if recording { toggleOverdub() }
+            if armed { loops.disarmOverdub() }
             removeMonitors()
             stopPreview()
             loops.preview(effects: nil, for: draft.id)
         }
         .onChange(of: draft) { _, new in
-            if previewing { startPreview() }
+            if previewing && !recording { startPreview() }
             loops.preview(effects: new.effects, for: new.id)
         }
         .onReceive(BeatClock.shared.$beat) { beat in
@@ -108,7 +118,10 @@ struct LoopStudio: View {
         HStack(spacing: 12) {
             Button { close() } label: { Label(tr("Loops"), systemImage: "chevron.left").fixedSize() }
                 .buttonStyle(AppButtonStyle(kind: .ghost, height: 28))
+            LoopColorButton(loops: loops, loop: original ?? draft, size: 16)
             TextField("", text: $draft.name).textFieldStyle(.plain).font(.system(size: 18, weight: .bold)).frame(maxWidth: 220)
+                .disabled(locked)
+            Group {
             InstrumentMenu(instruments: instruments, selected: draft.instrument ?? instruments.selectedId) { id in
                 commit { d in
                     d.instrument = id
@@ -128,6 +141,8 @@ struct LoopStudio: View {
             stepper(tr("Largo"), LoopMath.formatLength(draft.lengthBeats),
                     down: { setLength(draft.lengthBeats - LoopMath.beatsPerBar) },
                     up: { setLength(draft.lengthBeats + LoopMath.beatsPerBar) })
+            }
+            .disabled(locked)
             Spacer(minLength: 8)
             transport
             Button { if let copy = loops.duplicate(draft.id) { draft = copy; undoStack = []; redoStack = [] } } label: {
@@ -135,11 +150,20 @@ struct LoopStudio: View {
             }
             .buttonStyle(.appSecondary)
             IconButton(symbol: "arrow.uturn.backward", label: tr("Deshacer (⌘Z)"), size: 28) { undo() }
-                .disabled(undoStack.isEmpty)
+                .disabled(undoStack.isEmpty || locked)
             IconButton(symbol: "arrow.uturn.forward", label: tr("Rehacer (⇧⌘Z)"), size: 28) { redo() }
-                .disabled(redoStack.isEmpty)
+                .disabled(redoStack.isEmpty || locked)
+            Button {
+                if !locked { draft = original ?? draft; undoStack = []; redoStack = [] }
+                loops.setLocked(draft.id, !locked)
+            } label: {
+                Label(locked ? tr("Protegido") : tr("Proteger"), systemImage: locked ? "lock.fill" : "lock.open").fixedSize()
+            }
+            .buttonStyle(AppButtonStyle(kind: locked ? .primary : .secondary, height: 28))
+            .help(locked ? tr("Protegido: no se puede cambiar ni borrar. Clic para desbloquear.")
+                         : tr("Proteger: que no se pueda cambiar ni borrar (descarta los cambios sin guardar)"))
             Button(tr("Guardar")) { loops.save(draft) }
-                .buttonStyle(.appPrimary).disabled(!dirty)
+                .buttonStyle(.appPrimary).disabled(!dirty || locked)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
@@ -149,7 +173,32 @@ struct LoopStudio: View {
     private var transport: some View {
         HStack(spacing: 4) {
             IconButton(symbol: previewing ? "stop.fill" : "play.fill", label: tr("Escuchar (espacio)"),
-                       kind: previewing ? .primary : .secondary, size: 30) { togglePreview() }
+                       kind: previewing ? .primary : .secondary, size: 30) {
+                if recording { toggleOverdub() }
+                if armed { loops.disarmOverdub() }
+                togglePreview()
+            }
+            Button { toggleOverdub() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: recording ? "stop.circle.fill" : (armed ? "hourglass" : "record.circle"))
+                        .font(.system(size: 13, weight: .bold))
+                    Text(recording ? tr("Toma %d · %d notas", recordingTake, loops.overdubEvents.count)
+                         : armed ? tr("Toca una tecla para empezar…")
+                         : (draft.events.isEmpty ? tr("Grabar") : tr("Grabar encima")))
+                        .font(.system(size: 12, weight: .bold))
+                }
+                .padding(.horizontal, 10).frame(height: 30)
+                .foregroundStyle(recording || armed ? Theme.window : Theme.danger)
+                .background(recording ? Theme.danger : (armed ? Theme.warn : Theme.danger.opacity(0.14)), in: RoundedRectangle(cornerRadius: 7))
+                .fixedSize()
+            }
+            .buttonStyle(.plain)
+            .disabled(locked)
+            .help(tr("Graba lo que tocas mientras el loop suena, en una toma nueva de otro color (R)"))
+            toggleChip(tr("Esperar tecla"), on: waitForKey, enabled: !recording && !armed,
+                       help: tr("Al pulsar grabar, silencio hasta que toques: el loop empieza en esa tecla (y esa nota cae en el tiempo 1)")) {
+                waitForKey.toggle()
+            }
             toggleChip("A–B", on: abOn && region != nil, enabled: region != nil,
                        help: tr("Repetir solo la parte A–B (arrastra en la regla para marcarla)")) { abOn.toggle(); restartIfPlaying() }
             toggleChip(tr("Batería"), on: withDrums, enabled: true, help: tr("Escuchar con la batería")) {
@@ -190,6 +239,7 @@ struct LoopStudio: View {
 
     private var toolBar: some View {
         HStack(spacing: 10) {
+            Group {
             SegmentedControl(options: [(tr("↖ Seleccionar"), Tool.select), (tr("✎ Lápiz"), .pencil), (tr("⌫ Borrar"), .eraser)],
                              selection: $tool)
                 .fixedSize()
@@ -225,6 +275,8 @@ struct LoopStudio: View {
             tool("+1 st") { transposeSelection(1) }
             tool(tr("Más suave")) { scaleVelocity(0.85) }
             tool(tr("Más fuerte")) { scaleVelocity(1.15) }
+            }
+            .disabled(locked)
             Spacer(minLength: 6)
             Text(tr("Zoom")).font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.text3)
             IconButton(symbol: "minus.magnifyingglass", label: tr("Alejar (⌘ + rueda)"), size: 26) { zoom(0.7) }
@@ -579,17 +631,30 @@ struct LoopStudio: View {
             guard r.maxX >= 0, r.minX <= g.width, r.maxY >= 0, r.minY <= g.height else { continue }
             let isSel = selected.contains(i)
             let shape = Path(roundedRect: r.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 4)
+            let tint = takeColor(e.take)
+            let fade = draft.isMuted(e) ? 0.3 : 1.0
             if e.midi != nil {
-                context.fill(shape, with: .color((isSel ? Theme.accentText : Theme.accentFill).opacity(0.45 + 0.55 * Double(e.velocity) / 127)))
+                context.fill(shape, with: .color((isSel ? Theme.accentText : tint).opacity((0.45 + 0.55 * Double(e.velocity) / 127) * fade)))
             } else {
-                context.fill(shape, with: .color(Theme.accentSoft))
-                context.stroke(shape, with: .color(Theme.accent), lineWidth: 1.5)
+                context.fill(shape, with: .color(tint.opacity(0.22 * fade)))
+                context.stroke(shape, with: .color(tint.opacity(fade)), lineWidth: 1.5)
             }
             if isSel { context.stroke(shape, with: .color(Theme.text), lineWidth: 2) }
             if r.width > 26 && r.height >= 10 {
                 context.draw(Text(label(of: e)).font(.system(size: min(10, r.height - 2), weight: .semibold))
                     .foregroundColor(e.midi != nil ? Theme.onAccent : Theme.accentText),
                              at: CGPoint(x: r.minX + 4, y: e.midi != nil ? r.midY : r.minY + 7), anchor: .leading)
+            }
+        }
+        // Notes being recorded over the loop, live in the new take's colour.
+        if recording {
+            let tint = takeColor(recordingTakeValue)
+            for var e in loops.overdubEvents {
+                e.start = (e.start + playOffset).truncatingRemainder(dividingBy: draft.lengthBeats)
+                let r = rect(e, g)
+                let shape = Path(roundedRect: r.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 4)
+                context.fill(shape, with: .color(tint.opacity(e.midi != nil ? 0.9 : 0.25)))
+                context.stroke(shape, with: .color(tint), style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
             }
         }
         if let m = marquee {
@@ -621,6 +686,11 @@ struct LoopStudio: View {
         let p = v.startLocation
         let hitIndex = hit(p, g)
         var state = DragState(mode: .marquee, snapshot: draft, originals: [:], startBeat: g.beat(p.x), startNote: g.midi(p.y))
+        if locked {
+            if let i = hitIndex { selected = shift ? selected.symmetricDifference([i]) : [i] } else if !shift { selected = [] }
+            drag = state
+            return
+        }
         switch tool {
         case .eraser:
             state.mode = .erase
@@ -750,6 +820,7 @@ struct LoopStudio: View {
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
+                    guard !locked else { return }
                     if drag == nil { drag = DragState(mode: .move, snapshot: draft, originals: [:], startBeat: 0, startNote: 0) }
                     let v127 = Int((1 - min(1, max(0, (v.location.y - 4) / (size.height - 10)))) * 126) + 1
                     let targets = draft.events.indices.filter { abs(g.x(draft.events[$0].start) + 3 - v.location.x) < 6 }
@@ -766,6 +837,7 @@ struct LoopStudio: View {
     // MARK: Editing helpers
 
     private func commit(_ change: (inout Loop) -> Void) {
+        guard !locked else { return }
         let before = draft
         change(&draft)
         if before != draft { pushUndo(before) }
@@ -832,6 +904,106 @@ struct LoopStudio: View {
         }
         selected = []
         sortKeepingSelection()
+    }
+
+    // MARK: Takes
+
+    private var recording: Bool { loops.overdubbing == draft.id }
+    /// Take the next recording goes to: the main one in an empty loop, else one more.
+    private var nextTake: Int? { draft.events.isEmpty ? nil : (draft.events.compactMap(\.take).max() ?? 0) + 1 }
+    @State private var recordingTakeValue: Int?
+    private var recordingTake: Int { (recordingTakeValue ?? 0) + 1 }
+
+    private func toggleOverdub() {
+        if recording {
+            let caught = loops.stopOverdub()
+            guard !caught.isEmpty else { return }
+            commit { d in
+                for var e in caught {
+                    // Back to the draft's beats (the A–B part plays from `playOffset`).
+                    e.start = (e.start + playOffset).truncatingRemainder(dividingBy: d.lengthBeats)
+                    e.length = min(e.length, d.lengthBeats)
+                    d.events.append(e)
+                }
+                d.events.sort { $0.start < $1.start }
+            }
+            selected = []
+        } else if armed {
+            loops.disarmOverdub()
+        } else {
+            guard !locked else { return }
+            recordingTakeValue = nextTake
+            if waitForKey {
+                // Silence until the first key; then the loop starts on it and records.
+                if previewing { stopPreview() }
+                let (loop, offset) = previewLoop()
+                loops.armOverdub(loop, take: nextTake) {
+                    playOffset = offset
+                    playLength = loop.lengthBeats
+                    previewing = true
+                    syncDrums()
+                }
+            } else {
+                if !previewing { startPreview() }
+                loops.startOverdub(take: nextTake)
+            }
+        }
+    }
+
+    private var armed: Bool { loops.overdubArmed == draft.id }
+    @AppStorage("overdubWaitForKey") private var waitForKey = true
+
+    /// Colour of a take: the main one in the loop's colour (or accent), the others in their own.
+    private func takeColor(_ take: Int?) -> Color {
+        guard let t = take, t > 0 else { return (original ?? draft).tint ?? Theme.accentFill }
+        return KeyboardConfig.palette[(t + 1) % KeyboardConfig.palette.count]
+    }
+
+    private var takesPanel: some View {
+        let takes = draft.takes
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(tr("Tomas"))
+            ForEach(takes, id: \.self) { t in
+                let muted = draft.mutedTakes?.contains(t) == true
+                let count = draft.events.filter { ($0.take ?? 0) == t }.count
+                HStack(spacing: 6) {
+                    Circle().fill(takeColor(t)).frame(width: 10, height: 10).opacity(muted ? 0.35 : 1)
+                    Text(t == 0 ? tr("Principal") : tr("Toma %d", t + 1)).font(.system(size: 12, weight: .semibold))
+                    Text(tr("%d notas", count)).font(.system(size: 10)).foregroundStyle(Theme.text3)
+                    Spacer(minLength: 2)
+                    IconButton(symbol: muted ? "speaker.slash.fill" : "speaker.wave.2", label: muted ? tr("Hacer que suene") : tr("Silenciar esta toma"),
+                               kind: muted ? .primary : .ghost, size: 22) {
+                        commit { d in
+                            var m = Set(d.mutedTakes ?? [])
+                            if m.contains(t) { m.remove(t) } else { m.insert(t) }
+                            d.mutedTakes = m.isEmpty ? nil : m.sorted()
+                        }
+                    }
+                    IconButton(symbol: "selection.pin.in.out", label: tr("Seleccionar sus notas"), size: 22) {
+                        selected = Set(draft.events.indices.filter { (draft.events[$0].take ?? 0) == t })
+                    }
+                    if t > 0 {
+                        IconButton(symbol: "arrow.down.to.line", label: tr("Pasarla a la principal"), size: 22) {
+                            commit { d in
+                                for i in d.events.indices where d.events[i].take == t { d.events[i].take = nil }
+                                d.mutedTakes = d.mutedTakes?.filter { $0 != t }
+                                if d.mutedTakes?.isEmpty == true { d.mutedTakes = nil }
+                            }
+                        }
+                    }
+                    IconButton(symbol: "trash", label: tr("Borrar esta toma"), size: 22) {
+                        commit { d in
+                            d.events.removeAll { ($0.take ?? 0) == t }
+                            d.mutedTakes = d.mutedTakes?.filter { $0 != t }
+                            if d.mutedTakes?.isEmpty == true { d.mutedTakes = nil }
+                        }
+                        selected = []
+                    }
+                }
+            }
+            Text(tr("● Grabar encima añade una toma de otro color mientras el loop suena. Silencia una toma para guardarla como alternativa."))
+                .font(.system(size: 10)).foregroundStyle(Theme.text3).fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private func linkSeam() {
@@ -953,15 +1125,20 @@ struct LoopStudio: View {
 
     private func togglePreview() { previewing ? stopPreview() : startPreview() }
 
-    private func startPreview() {
+    /// What ▶ plays: the whole draft, or only its A–B part (and where that part starts).
+    private func previewLoop() -> (Loop, Double) {
         var loop = draft
         if let r = region, abOn {
             loop.events = LoopMath.trim(draft.events, start: r.lowerBound, end: r.upperBound)
             loop.lengthBeats = r.upperBound - r.lowerBound
-            playOffset = r.lowerBound
-        } else {
-            playOffset = 0
+            return (loop, r.lowerBound)
         }
+        return (loop, 0)
+    }
+
+    private func startPreview() {
+        let (loop, offset) = previewLoop()
+        playOffset = offset
         playLength = loop.lengthBeats
         loops.preview(loop)
         previewing = true
@@ -1014,6 +1191,14 @@ struct LoopStudio: View {
         let cmd = event.modifierFlags.contains(.command), shift = event.modifierFlags.contains(.shift)
         let alt = event.modifierFlags.contains(.option)
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        if locked {
+            // Protected: only listening, selecting and copying.
+            if event.keyCode == 49 && !cmd { togglePreview(); return true }
+            if cmd && chars == "c" { copySelection(); return true }
+            if cmd && chars == "a" { selected = Set(draft.events.indices); return true }
+            return false
+        }
+        if !cmd && chars == "r" { toggleOverdub(); return true }
         switch event.keyCode {
         // ⌥ ← →: the finest nudge (1/96 of a beat), whatever the grid.
         case 123: moveSelection(beats: -(alt ? LoopMath.fine : (shift ? LoopMath.beatsPerBar : gridStepOrBeat))); return !selected.isEmpty
@@ -1064,12 +1249,28 @@ struct LoopStudio: View {
     private var inspector: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                seamPanel
-                selectionPanel
-                fitPanel
+                if locked {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label(tr("Loop protegido"), systemImage: "lock.fill").font(.system(size: 12, weight: .bold)).foregroundStyle(Theme.warn)
+                        Text(tr("Puedes escucharlo, copiarlo y cambiarle el color. Para editarlo, desbloquéalo o haz un duplicado."))
+                            .font(.system(size: 11)).foregroundStyle(Theme.text2).fixedSize(horizontal: false, vertical: true)
+                        Button { loops.setLocked(draft.id, false) } label: { Text(tr("Desbloquear")).frame(maxWidth: .infinity) }
+                            .buttonStyle(AppButtonStyle(kind: .secondary, height: 28, fullWidth: true))
+                    }
+                    .padding(12)
+                    .background(Theme.warn.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                }
+                Group {
+                    if !draft.events.isEmpty { takesPanel }
+                    seamPanel
+                    selectionPanel
+                    fitPanel
+                }
+                .disabled(locked)
                 abPanel
                 EffectsEditor(effects: Binding(get: { draft.effects ?? .none },
                                                set: { v in commit { $0.effects = v.isOff ? nil : v } }))
+                    .disabled(locked)
             }
             .padding(16)
         }
