@@ -32,6 +32,8 @@ final class RemoteClient: ObservableObject {
     let live = LiveKeys()
     /// Song playhead; its own object so only the song card redraws 8 times a second.
     let song = SongClock()
+    /// Chord being played in the open song; its own object so only the music stand redraws.
+    let sheet = SheetFollow()
 
     private var browser: NWBrowser?
     private var results: [String: NWEndpoint] = [:]
@@ -71,17 +73,31 @@ final class RemoteClient: ObservableObject {
     private func found(_ list: [(String, NWEndpoint)]) {
         for (name, endpoint) in list { results[name] = endpoint }
         macs = results.keys.sorted()
-        if connection == nil, let name = preferred.flatMap({ results[$0] != nil ? $0 : nil }) ?? macs.first {
-            connect(to: name)
+        // The chosen Mac showed up after settling for another one: go to it.
+        if let p = preferred, results[p] != nil, currentName != p {
+            connect(to: p)
+        } else if connection == nil, let name = macs.first {
+            connect(to: name, remember: false)
         }
     }
 
-    /// Connect to a Mac by its Bonjour name (remembered for next time).
-    func connect(to name: String) {
+    /// Mac connected or connecting to.
+    private var currentName: String? {
+        switch status {
+        case .connecting(let n), .connected(let n): return n
+        case .searching: return nil
+        }
+    }
+
+    /// Connect to a Mac by its Bonjour name (remembered for next time, unless it's just the
+    /// first one found while the chosen one isn't around).
+    func connect(to name: String, remember: Bool = true) {
         guard let endpoint = results[name] else { return }
         connection?.cancel()
-        preferred = name
-        UserDefaults.standard.set(name, forKey: "preferredMac")
+        if remember {
+            preferred = name
+            UserDefaults.standard.set(name, forKey: "preferredMac")
+        }
         status = .connecting(name)
         buffer = LineBuffer()
         let tcp = NWProtocolTCP.Options()
@@ -99,7 +115,7 @@ final class RemoteClient: ObservableObject {
                 case .ready:
                     self.status = .connected(name)
                     self.send(.hello(version: RemoteProtocol.version, device: UIDevice.current.name))
-                    self.remember(connection)
+                    if name == self.preferred { self.remember(connection) }
                 case .failed, .cancelled:
                     self.lost()
                 default:
@@ -147,8 +163,10 @@ final class RemoteClient: ObservableObject {
         status = .searching
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self, self.connection == nil else { return }
-            if let name = self.preferred.flatMap({ self.results[$0] != nil ? $0 : nil }) ?? self.macs.first {
-                self.connect(to: name)
+            if let p = self.preferred, self.results[p] != nil {
+                self.connect(to: p)
+            } else if let name = self.macs.first {
+                self.connect(to: name, remember: false)
             }
         }
     }
@@ -186,6 +204,9 @@ final class RemoteClient: ObservableObject {
             song.playing = playing
             song.beat = beat
             song.bpm = bpm
+        case .sheetPosition(let id, let index):
+            sheet.id = id
+            sheet.index = index
         case .notes(let device, let midi):
             live.notes[device] = Set(midi)
         case .pong(let id):
@@ -216,6 +237,13 @@ final class RemoteClient: ObservableObject {
 @MainActor
 final class LiveKeys: ObservableObject {
     @Published var notes: [String: Set<Int>] = [:]
+}
+
+/// Chord being played in the Mac's open song (−1: before the first).
+@MainActor
+final class SheetFollow: ObservableObject {
+    @Published var id: String?
+    @Published var index = -1
 }
 
 /// The Mac's song: playing or not and where (beats from the start).

@@ -102,6 +102,26 @@ struct RemoteSynth: Codable, Equatable {
     var audition: String?
 }
 
+/// A song with chords in the Mac's «Repertorio».
+struct RemoteSheetRef: Codable, Equatable, Identifiable {
+    var id: String
+    var title: String
+    var artist: String?
+    /// Key as shown (transposed).
+    var key: String?
+}
+
+/// The song open on the Mac: its ChordPro text (the iPad parses it with `ParsedSheet`).
+struct RemoteSheet: Codable, Equatable {
+    var id: String
+    var title: String
+    var artist: String?
+    var source: String
+    var transpose: Int
+    var latin: Bool
+    var following: Bool
+}
+
 struct RemoteState: Codable, Equatable {
     var macName: String
     var bpm: Int
@@ -131,6 +151,9 @@ struct RemoteState: Codable, Equatable {
     var songBars: Int?
     var songHasClips: Bool?
     var synth: RemoteSynth?
+    /// Songs with chords and the one open.
+    var sheets: [RemoteSheetRef]?
+    var sheet: RemoteSheet?
 }
 
 /// Mac → iPad.
@@ -149,6 +172,8 @@ enum RemoteMessage: Codable {
     case notes(device: String, midi: [Int])
     /// Song playhead (beats from the start), ~8 times a second while it plays and on changes.
     case song(playing: Bool, beat: Double, bpm: Int)
+    /// Chord being played in the open song (−1: before the first).
+    case sheetPosition(id: String, index: Int)
 }
 
 /// iPad → Mac.
@@ -211,6 +236,12 @@ enum RemoteCommand: Codable {
     /// The iPad's try-out keyboard: notes of the edited sound on the Mac.
     case synthNoteOn(midi: Int, velocity: Int)
     case synthNoteOff(midi: Int)
+    case sheetOpen(id: String)
+    /// Semitones from the original (−6…6).
+    case sheetTranspose(id: String, semitones: Int)
+    /// Jump to a chord (−1: back to the start).
+    case sheetSeek(index: Int)
+    case sheetFollow(Bool)
 }
 
 /// Splits a TCP byte stream into JSON lines.

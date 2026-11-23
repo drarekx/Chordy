@@ -40,6 +40,10 @@ Basado en [ChordBoy](https://www.jameshsi.com/?ref=chordboy) de james.
 
 <p align="center"><img src="docs/midi.png" width="590" alt="Panel MIDI con el Launchkey conectado"></p>
 
+5. **Toca tus canciones.** En **Repertorio**, pega una canción con acordes copiada de cualquier web (los acordes encima de la letra) o arrastra archivos `.txt` o ChordPro (`.cho`). Chordy pasa los acordes a la letra, calcula el tono y te deja transponer. Mientras tocas, el acorde que suena se ilumina y la letra avanza sola, en el Mac y en el atril del iPad.
+
+<p align="center"><img src="docs/repertorio.png" width="590" alt="Repertorio con Amazing Grace abierta y el acorde Em iluminado"></p>
+
 ## Todo lo que hace
 
 - **Teclado de acordes**: tres modos (mayor, menor, dórico), los 12 tonos, nueve colores de acorde y octava abajo. Los acordes que suenan siguen al momento los cambios de color, tono y octava.
@@ -55,6 +59,7 @@ Basado en [ChordBoy](https://www.jameshsi.com/?ref=chordboy) de james.
 - **Dibujo de los aparatos**: el Launchkey 25 MK2 y el Yamaha PSR-E453 dibujados en vivo; las teclas, pads, knobs y ruedas se mueven al tocarlos y muestran a qué están asignados.
 - **Caja de ritmos**: patrones A–H de 16 pasos con kit propio, fuerza por paso, volumen, silencio y solo por pista, sonidos alternativos del kit, cadena de patrones para una canción, herramientas (rellenar, desplazar, aleatorio) y grabación tocando los pads. Vista propia a pantalla completa (⌘B). Los pads del Launchkey programan los pasos o tocan la batería.
 - **Editor de loops**: mover, alargar, añadir y borrar notas y acordes; cambiar tono, tempo y largo; transponer, cuantizar y suavizar; duplicar; reverb, eco y filtro por loop. Los loops graban también las notas sueltas del piano y el instrumento de cada parte.
+- **Repertorio**: canciones con acordes sobre la letra, pegadas de una web o importadas de `.txt` y ChordPro (`.cho`). Detecta tono, secciones (estrofa, estribillo, puente), cejilla y tempo; transpone con sostenidos o bemoles según el tono; nombres en C D E o Do Re Mi. Sigue lo que tocas (teclado MIDI, pads o teclado del Mac) y avanza el acorde resaltado; «Usar el tono» pone Chordy en el tono de la canción y «Crear loop» hace un loop con sus acordes. En el iPad, la pestaña **Atril** muestra la misma canción en grande y sigue al Mac.
 - **Colores**: temas clásicos con sus colores oficiales (Solarized, Dracula, Nord, Gruvbox, Monokai, One Dark, Tokyo Night, Catppuccin, Rosé Pine, Everforest, Kanagawa, GitHub Dark) además del original.
 - **Idiomas**: castellano, inglés y catalán.
 - **Abrir al iniciar sesión**: se activa la primera vez que se abre desde Aplicaciones; se puede quitar en Ajustes.
@@ -70,7 +75,7 @@ Basado en [ChordBoy](https://www.jameshsi.com/?ref=chordboy) de james.
 
 ## Dónde guarda las cosas
 
-- Loops, sonidos propios, teclados, batería y mapeo MIDI: `~/Library/Application Support/Chordy/` (`loops.json`, `sounds.json`, `keyboards.json`, `drums.json`, `midi-map.json`).
+- Loops, sonidos propios, teclados, batería y mapeo MIDI: `~/Library/Application Support/Chordy/` (`loops.json`, `sounds.json`, `keyboards.json`, `drums.json`, `midi-map.json`, `songbook.json`).
 - Instrumentos descargados: `~/Library/Application Support/Chordy/Instruments/` (el piano de cola ocupa 1,3 GB; se quitan desde Sonido → Bancos).
 - Ajustes (tono, modo, tempo, tema, idioma…): `defaults read com.egluu.chordy`
 

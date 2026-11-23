@@ -23,7 +23,7 @@ struct StudioView: View {
     @AppStorage("mainMode") private var mode = Mode.studio
     @ObservedObject private var keyboards = AppModel.shared.keyboards
 
-    enum Mode: String { case studio, song, drums, synth, editor }
+    enum Mode: String { case studio, song, drums, synth, songbook, editor }
 
     enum SideTab: String, CaseIterable {
         case loops, chords, sound, midi
@@ -47,6 +47,8 @@ struct StudioView: View {
                 DrumView(drums: model.drums, engine: model.engine)
             } else if mode == .song {
                 SongView(song: model.song, loops: model.loops, drums: model.drums, engine: model.engine)
+            } else if mode == .songbook {
+                SongbookView(songbook: model.songbook, loops: model.loops)
             } else if mode == .synth {
                 SynthStudio(sounds: model.sounds, keyboards: model.keyboards, engine: model.engine)
             } else if mode == .editor {
@@ -110,7 +112,7 @@ struct StudioHeader: View {
             ProjectMenu(projects: AppModel.shared.projects)
                 .padding(.leading, 64)
             SegmentedControl(options: [(tr("Estudio"), StudioView.Mode.studio), (tr("Canción"), .song), (tr("Batería"), .drums),
-                                       (tr("Sintetizador"), .synth)], selection: $mode)
+                                       (tr("Sintetizador"), .synth), (tr("Repertorio"), .songbook)], selection: $mode)
                 .fixedSize()
                 .background {
                     Button("") { mode = mode == .drums ? .studio : .drums }

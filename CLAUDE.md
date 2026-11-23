@@ -56,6 +56,9 @@ git tag v1.0.1 && git push origin v1.0.1
 | `SynthStudio.swift` | Vista «Sintetizador»: biblioteca (tuyos y de fábrica: nuevo, duplicar, renombrar, borrar), editor a dos columnas, teclado para probar y «Usar en un teclado» |
 | `Song.swift` / `SongView.swift` | Canción: pistas (batería + loops), clips en compases que repiten su loop o patrón; reproductor sobre `Transport` (batería por `DrumMachine.playSong`, notas de loop programadas por delante); vista con biblioteca arrastrable, mover/alargar clips, silenciar pistas |
 | `Projects.swift` | Proyectos `.chordy` (JSON con canción, loops, batería, tono/tempo, teclados y sonidos propios): nuevo, abrir, recientes, guardar (⌘S), guardar como (⇧⌘S), autoguardado cada 30 s si hay cambios (sin archivo: `Autoguardado.chordy` en Application Support) |
+| `ChordSheet.swift` | Canciones con acordes (compartido con el iPad): `ChordName` (leer, transponer, reconocer lo que se toca), `ParsedSheet` (ChordPro → secciones, líneas, acordes en orden), `ChordFollower` (avanza al tocar el siguiente), `ChordSheetImport` (acordes encima de la letra → ChordPro, tono calculado) |
+| `ChordSheetView.swift` | Dibujo de la canción (compartido con el iPad): `ChordSheetBody` con colores por parámetro (`SheetStyle`) y `SheetFlow` (Layout que parte las líneas largas entre palabras) |
+| `Songbook.swift` / `SongbookView.swift` | Repertorio: `songbook.json`, importar (pegar, archivos, arrastrar), editar, transponer, seguir lo que se toca, «Usar el tono» y «Crear loop»; vista con lista y lector |
 | `MidiMapping.swift` | Controles, acciones mapeables y presets (Teclas, Launchkey 25 MK2) |
 | `MidiController.swift` | Learn, guiado, automapeo, despacho de acciones, salida de acordes, luces del Launchkey (InControl) |
 | `MidiPanel.swift` | Panel MIDI |
@@ -133,6 +136,8 @@ git tag v1.0.1 && git push origin v1.0.1
 - **Sonidos de sintetizador por teclado**: el instrumento puede ser `synth` (el sonido que se edita) o `synth:<patch id>` (`InstrumentLibrary.isSynth/synthPatchId/synth(_:)`); `SoundLibrary.patch(for:)` devuelve el borrador si es el seleccionado, así los teclados que lo usan oyen la edición en directo. Las voces del sinte llevan el hash del `Patch.id` y `updateLive` solo toca las de ese sonido.
 - **Editor de loops como modo** (`mainMode = editor`, `Loops.studioId`): ventana propia con monitores locales de teclado y rueda que solo viven mientras está abierto; `KeyboardInput` se calla en ese modo para que espacio, flechas y borrar sean del editor. A–B = el borrador recortado a la región, reproducido con el id del loop (mismo bus de efectos).
 - **⌘S es del proyecto**: el editor de loops y el sintetizador tienen su botón «Guardar» sin atajo (dos atajos iguales en la misma ventana no se sabe cuál gana). Borrar un loop pide confirmación y quita sus clips de la canción.
+- **Repertorio (canciones con acordes)**: la canción se guarda como texto ChordPro; lo pegado de una web (acordes en su línea encima de la letra) se convierte al importar, metiendo cada acorde en su columna. Una línea es de acordes solo si **todas** sus palabras son acordes (o `|`, `x2`…): así «A», «Am» o «Do» en la letra no se leen como acordes; «Bob» o «Solo» tampoco (la «o» de disminuido solo vale sola). Seguir: notas del usuario (acordes de `engine.sounding` con `source == .user` + `heldNotes`) → clases de nota → `ChordName.isPlayed` (raíz y tercera presentes y ≥ 74 % de lo que suena dentro del acorde, así C–E–G no cuenta como Em) contra el acorde siguiente o el de después; el mismo acorde repetido necesita soltar y volver a tocar. El iPad recibe el texto en `RemoteState.sheet` y la posición aparte (`.sheetPosition`). Gancho: `sheetimport:<archivo,…>`, `sheetopen:<n>`, `sheetseek:<n>`, `sheettranspose:<n>`, `sheetloop:<archivo>`. Ejemplos de dominio público en `Samples/Songs/`.
+- **Probar el iPad en el simulador con la app instalada abierta**: `-remoteName "Chordy Prueba"` al lanzar la de debug le da otro nombre Bonjour, y el iPad sin Mac preferido coge el primero por orden alfabético. `simctl spawn … defaults write` no llega a la app (sus ajustes viven en su contenedor): para elegir pestaña, `xcrun simctl launch <id> com.egluu.chordypads -tab sheet`. El iPad antes se quedaba para siempre con el primer Mac que veía al arrancar (lo guardaba como preferido); ahora solo recuerda el que eliges y salta a él cuando aparece.
 - **Realimentación MIDI entre dos Chordy**: la instalada y la de debug publican cada una una fuente virtual «Chordy» y cada una escuchaba la de la otra → bucle infinito de notas que disparó «grabar loop» cientos de veces y llenó `loops.json` (25 MB, 600 loops) en un minuto. `MidiIO.isChordyOutput` descarta cualquier fuente virtual llamada como la app. Antes de probar con la de debug, cerrar la instalada si su versión no lleva este arreglo.
 
 ## Pruebas manuales
@@ -145,7 +150,7 @@ git tag v1.0.1 && git push origin v1.0.1
 
 ## Ideas para después
 
-- Overdub en loops (grabar capas encima de un loop que suena).
+- Repertorio fase 2: MIDI (`MusicSequenceFileLoad`: piano roll, modo práctica, sacar acordes) y fase 3: MusicXML dibujado en el iPad (OpenSheetMusicDisplay en un `WKWebView`) y PDF solo para ver.
 - Inversiones automáticas (encadenar cada acorde con la inversión más cercana al anterior).
 - Exportar un loop a `.mid` o audio.
 - Arpegiador al tempo.

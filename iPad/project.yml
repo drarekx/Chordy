@@ -19,6 +19,8 @@ targets:
       - path: Resources
       - path: ../Sources/Chordy/RemoteProtocol.swift
       - path: ../Sources/Chordy/Patch.swift
+      - path: ../Sources/Chordy/ChordSheet.swift
+      - path: ../Sources/Chordy/ChordSheetView.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.egluu.chordypads

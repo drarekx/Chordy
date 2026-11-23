@@ -52,7 +52,7 @@ struct RootView: View {
     @AppStorage("tab") private var tab = Tab.pads
 
     enum Tab: String, CaseIterable {
-        case pads, steps, keys, synth, mix
+        case pads, steps, keys, synth, mix, sheet
         var title: String {
             switch self {
             case .pads: return "Pads"
@@ -60,6 +60,7 @@ struct RootView: View {
             case .keys: return "Teclados"
             case .synth: return "Sinte"
             case .mix: return "Mezcla"
+            case .sheet: return "Atril"
             }
         }
     }
@@ -76,6 +77,7 @@ struct RootView: View {
                     case .keys: KeysView(client: client, state: state)
                     case .synth: SynthView(client: client, state: state)
                     case .mix: MixView(client: client, state: state)
+                    case .sheet: SheetStandView(client: client, follow: client.sheet, state: state)
                     }
                 }
                 .padding(16)
@@ -113,7 +115,7 @@ struct RootView: View {
                 ForEach(Tab.allCases, id: \.self) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
-            .frame(width: 440)
+            .frame(width: 520)
             Spacer()
             if let state = client.state {
                 Button { client.send(.togglePlay) } label: {

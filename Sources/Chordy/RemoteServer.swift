@@ -19,6 +19,7 @@ final class RemoteServer: ObservableObject {
     private let sounds: SoundLibrary
     private let instruments: InstrumentLibrary
     private let song: Song
+    private let songbook: Songbook
     private var songTimer: Timer?
     /// Notes the iPad's try-out keyboard holds: MIDI note → voice.
     private var tryVoices: [Int: Int] = [:]
@@ -39,7 +40,8 @@ final class RemoteServer: ObservableObject {
     }
 
     init(drums: DrumMachine, engine: ChordEngine, keyboards: Keyboards, loops: Loops,
-         midi: MidiController, sounds: SoundLibrary, instruments: InstrumentLibrary, song: Song) {
+         midi: MidiController, sounds: SoundLibrary, instruments: InstrumentLibrary, song: Song,
+         songbook: Songbook) {
         self.drums = drums
         self.engine = engine
         self.keyboards = keyboards
@@ -48,6 +50,7 @@ final class RemoteServer: ObservableObject {
         self.sounds = sounds
         self.instruments = instruments
         self.song = song
+        self.songbook = songbook
     }
 
     func start() {
@@ -59,7 +62,9 @@ final class RemoteServer: ObservableObject {
             let parameters = NWParameters(tls: nil, tcp: tcp)
             parameters.includePeerToPeer = true
             let listener = try NWListener(using: parameters)
-            listener.service = NWListener.Service(name: Host.current().localizedName ?? "Chordy", type: RemoteProtocol.service)
+            // `-remoteName <name>` at launch: a test copy shows up apart from the installed one.
+            let name = UserDefaults.standard.string(forKey: "remoteName") ?? Host.current().localizedName ?? "Chordy"
+            listener.service = NWListener.Service(name: name, type: RemoteProtocol.service)
             listener.newConnectionHandler = { [weak self] connection in
                 DispatchQueue.main.async { self?.accept(connection) }
             }
@@ -72,10 +77,15 @@ final class RemoteServer: ObservableObject {
             NSLog("Chordy: could not start the remote listener: \(error)")
         }
         for publisher in [drums.objectWillChange, engine.objectWillChange, keyboards.objectWillChange, loops.objectWillChange,
-                          sounds.objectWillChange, instruments.objectWillChange, midi.devices.objectWillChange] {
+                          sounds.objectWillChange, instruments.objectWillChange, midi.devices.objectWillChange,
+                          songbook.objectWillChange] {
             publisher.sink { [weak self] _ in self?.scheduleState() }.store(in: &cancellables)
         }
         song.$data.sink { [weak self] _ in self?.scheduleState() }.store(in: &cancellables)
+        // The chord being played in the open song (and a jump when another song opens).
+        songbook.$position.combineLatest(songbook.$openId).receive(on: RunLoop.main).sink { [weak self] _ in
+            self?.sendSheetPosition()
+        }.store(in: &cancellables)
         // The song's playhead: often while it plays, once when it stops or jumps.
         song.$playing.removeDuplicates().sink { [weak self] playing in
             DispatchQueue.main.async { self?.songPlaying(playing) }
@@ -191,7 +201,7 @@ final class RemoteServer: ObservableObject {
         lastState = state
         broadcast(.state(state))
         sendTick()
-        if force { sendBeat(BeatClock.shared.beat); sendSong() }
+        if force { sendBeat(BeatClock.shared.beat); sendSong(); sendSheetPosition() }
     }
 
     private func sendBeat(_ beat: Int?) {
@@ -229,6 +239,11 @@ final class RemoteServer: ObservableObject {
         if before != after, !asNew {
             for c in keyboards.configs where c.instrument == before { keyboards.update(c.id) { $0.instrument = after } }
         }
+    }
+
+    private func sendSheetPosition() {
+        guard let id = songbook.openId else { return }
+        broadcast(.sheetPosition(id: id, index: songbook.position))
     }
 
     private func sendNotes(_ notes: [String: Set<Int>]) {
@@ -296,7 +311,14 @@ final class RemoteServer: ObservableObject {
             songBars: song.lengthBars, songHasClips: !song.data.clips.isEmpty,
             synth: RemoteSynth(library: sounds.all.map { RemoteSoundRef(id: $0.id, name: $0.name, builtin: $0.isBuiltin) },
                                selectedId: sounds.selectedId, draft: sounds.draft, dirty: sounds.dirty,
-                               audition: keyboards.auditionId))
+                               audition: keyboards.auditionId),
+            sheets: songbook.sheets.map {
+                RemoteSheetRef(id: $0.id, title: $0.title, artist: $0.artist, key: songbook.shownKey($0))
+            },
+            sheet: songbook.open.map {
+                RemoteSheet(id: $0.id, title: $0.title, artist: $0.artist, source: $0.source, transpose: $0.transpose,
+                            latin: songbook.latin, following: songbook.following)
+            })
     }
 
     // MARK: Commands
@@ -385,6 +407,10 @@ final class RemoteServer: ObservableObject {
             tryVoices[midi] = engine.output.noteOn(midi: midi, velocity: max(1, min(127, velocity)), instrument: InstrumentLibrary.synthId)
         case .synthNoteOff(let midi):
             if let voice = tryVoices.removeValue(forKey: midi) { engine.output.noteOff(voice, pedal: false) }
+        case .sheetOpen(let id): if songbook.sheets.contains(where: { $0.id == id }) { songbook.open(id) }
+        case .sheetTranspose(let id, let semitones): songbook.setTranspose(id, max(-11, min(11, semitones)))
+        case .sheetSeek(let index): songbook.seek(index)
+        case .sheetFollow(let on): songbook.following = on
         case .stopAll:
             for voice in tryVoices.values { engine.output.noteOff(voice, pedal: false) }
             tryVoices.removeAll()

@@ -318,6 +318,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     let song = AppModel.shared.song
                     song.addSection(at: 0); song.addSection(at: 4)
                 case "songplay": AppModel.shared.song.togglePlay()
+                case let command? where command.hasPrefix("sheetimport:"):
+                    // sheetimport:<file>[,<file>…] imports songs; sheetopen:<index>; sheetseek:<chord>;
+                    // sheettranspose:<semitones> (open song).
+                    let urls = command.dropFirst(12).split(separator: ",").map { URL(fileURLWithPath: String($0)) }
+                    AppModel.shared.songbook.importFiles(urls)
+                case let command? where command.hasPrefix("sheetopen:"):
+                    let book = AppModel.shared.songbook
+                    if let i = Int(command.dropFirst(10)), book.sheets.indices.contains(i) { book.open(book.sheets[i].id) }
+                case let command? where command.hasPrefix("sheetseek:"):
+                    if let i = Int(command.dropFirst(10)) { AppModel.shared.songbook.seek(i) }
+                case let command? where command.hasPrefix("sheetloop:"):
+                    // sheetloop:<file> makes a loop from the open song and writes its events.
+                    let loops = AppModel.shared.loops
+                    if let id = AppModel.shared.songbook.makeLoop(into: loops), let loop = loops.loops.first(where: { $0.id == id }) {
+                        let lines = ["\(loop.name) \(loop.tonic) \(loop.flavor) \(loop.lengthBeats)"]
+                            + loop.events.map { "\($0.start) \($0.degree) \($0.color) +\($0.accidental)" }
+                        try? lines.joined(separator: "\n").write(toFile: String(command.dropFirst(10)), atomically: true, encoding: .utf8)
+                    }
+                case let command? where command.hasPrefix("sheettranspose:"):
+                    let book = AppModel.shared.songbook
+                    if let t = Int(command.dropFirst(15)), let id = book.openId { book.setTranspose(id, t) }
                 case "devices":
                     // Toggle the device drawing on every keyboard card.
                     let kb = AppModel.shared.keyboards

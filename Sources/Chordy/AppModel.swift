@@ -16,6 +16,7 @@ final class AppModel: ObservableObject {
     let midi: MidiController
     let loops: Loops
     let song: Song
+    let songbook: Songbook
     private(set) lazy var projects = Projects(model: self)
 
     private init() {
@@ -42,8 +43,10 @@ final class AppModel: ObservableObject {
         midi.watch(loops.objectWillChange)
         midi.watch(drums.objectWillChange)
         song = Song(engine: engine, loops: loops, drums: drums, instruments: instruments)
+        songbook = Songbook(engine: engine)
         remote = RemoteServer(drums: drums, engine: engine, keyboards: keyboards, loops: loops,
-                              midi: midi, sounds: sounds, instruments: instruments, song: song)
+                              midi: midi, sounds: sounds, instruments: instruments, song: song,
+                              songbook: songbook)
     }
 
     func start() {
@@ -52,6 +55,7 @@ final class AppModel: ObservableObject {
         instruments.restore()
         keyboard.start()
         midi.start()
+        songbook.start()
         remote.start()
         projects.start()
     }
